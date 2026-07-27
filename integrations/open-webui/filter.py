@@ -24,6 +24,7 @@ This mirrors the Data-Agent-ADK OWUI filter, adapted to sage's tool set.
 
 import json
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger("altimate_owui_filter")
@@ -83,6 +84,23 @@ ARG_PREVIEW = {
     "question": lambda a: a.get("question"),
 }
 
+def _sql_reveal(args: dict) -> Optional[str]:
+    """Render an executed SQL statement into the chat body as a code block."""
+    query = str(args.get("query") or args.get("sql") or "").strip()
+    if not query:
+        return None
+    warehouse = str(args.get("warehouse") or "").strip()
+    title = f"SQL · {warehouse}" if warehouse else "SQL"
+    return f"\n\n**{title}**\n\n```sql\n{query}\n```\n"
+
+
+# Tools whose arguments should be surfaced into the message body (not just a
+# status pill). Maps tool name -> function(args) -> markdown (or None to skip).
+REVEAL_TOOLS = {
+    "sql_execute": _sql_reveal,
+}
+
+
 # Fallback preview keys for unknown / project-specific tools (checked in order).
 GENERIC_PREVIEW_KEYS = (
     "status_description",
@@ -114,10 +132,27 @@ def _fmt_duration(duration: object) -> str:
 
 class Filter:
     def __init__(self):
-        self._complete_emitted = False
+        self._reset_stream_state()
 
     def _reset_stream_state(self) -> None:
         self._complete_emitted = False
+        self._started_at = None
+        self._revealed = set()
+
+    def _mark_started(self) -> None:
+        # First activity of the turn — used to compute elapsed time as a fallback
+        # when the bridge does not provide overall_duration.
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+
+    def _resolve_duration(self, provided: object) -> float:
+        try:
+            d = float(provided) if provided is not None else 0.0
+        except (TypeError, ValueError):
+            d = 0.0
+        if d <= 0 and self._started_at is not None:
+            d = max(0.0, time.monotonic() - self._started_at)
+        return d
 
     async def _emit_status(self, description: str, done: bool, __event_emitter__) -> None:
         if __event_emitter__ is None:
@@ -129,11 +164,33 @@ class Filter:
             }
         )
 
+    async def _emit_message(self, content: str, __event_emitter__) -> None:
+        if __event_emitter__ is None or not content:
+            return
+        await __event_emitter__({"type": "message", "data": {"content": content}})
+
+    async def _maybe_reveal(self, tool_name: str, args: dict, __event_emitter__) -> None:
+        reveal_fn = REVEAL_TOOLS.get(tool_name)
+        if reveal_fn is None or __event_emitter__ is None or not isinstance(args, dict):
+            return
+        try:
+            markdown = reveal_fn(args)
+        except Exception:  # noqa: BLE001 - never let a reveal break the stream
+            markdown = None
+        if not markdown:
+            return
+        key = (tool_name, hash(markdown))
+        if key in self._revealed:
+            return
+        self._revealed.add(key)
+        await self._emit_message(markdown, __event_emitter__)
+
     async def _emit_complete(self, duration: object, __event_emitter__) -> None:
         if self._complete_emitted or __event_emitter__ is None:
             return
+        resolved = self._resolve_duration(duration)
         await self._emit_status(
-            f"✅ Complete in {_fmt_duration(duration)}. ", True, __event_emitter__
+            f"✅ Complete in {_fmt_duration(resolved)}. ", True, __event_emitter__
         )
         self._complete_emitted = True
 
@@ -190,9 +247,11 @@ class Filter:
 
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._reset_stream_state()
+        self._mark_started()
         return body
 
     async def stream(self, event: dict, __event_emitter__=None) -> Optional[dict]:
+        self._mark_started()
         choices = event.get("choices", []) or []
 
         # Collect any text content in this chunk.
@@ -229,6 +288,8 @@ class Filter:
         if payload is not None:
             kind, tool_name, args = payload
             if kind == "call":
+                # Surface configured tool args (e.g. SQL) into the message body.
+                await self._maybe_reveal(tool_name, args, __event_emitter__)
                 await self._emit_status(
                     self._status_for_tool(tool_name, args), False, __event_emitter__
                 )

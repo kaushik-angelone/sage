@@ -51,13 +51,31 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 
 ### What the filter does
 
-| Bridge chunk (`message_type`) | Filter behavior |
+| Bridge chunk | Filter behavior |
 | --- | --- |
-| `tool call` | Emits a status pill (friendly label + arg preview); drops the raw JSON. |
-| `tool response` | Dropped (kept out of the message body). |
-| `text` | Forwarded to the message body unchanged. |
+| tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. |
+| tool response (`{"name","duration"}`) | Dropped (kept out of the message body). |
+| plain text | Forwarded to the message body unchanged. |
 | completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. |
-| `error` | Emits a "❌ Error occurred." pill. |
+| error | Emits a "❌ Error occurred." pill. |
+
+Detection is content-based (it parses the `{"name", ...}` payload), so it does not
+depend on Open WebUI forwarding the custom `message_type` field.
 
 Tool labels and argument previews live in `TOOL_LABELS` / `ARG_PREVIEW` at the top
 of `filter.py` — edit those to taste.
+
+### Surfacing SQL (and other tool args) into the chat
+
+`REVEAL_TOOLS` maps a tool name to a function that renders its arguments into the
+message body. By default `sql_execute` renders the executed statement as a
+```sql``` code block above the answer, so the underlying SQL shows alongside the
+response. Add more entries to reveal other tools.
+
+### Execution time
+
+The "Complete in Xs" pill uses `overall_duration` from the bridge's final chunk
+when present, and otherwise falls back to the time the filter measured for the
+turn — so it stays correct even if the running `altimate` binary predates the
+`overall_duration` bridge change. Rebuild the binary to get the exact
+server-measured duration.
