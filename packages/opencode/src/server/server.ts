@@ -42,6 +42,9 @@ import { FileRoutes } from "./routes/file"
 import { ConfigRoutes } from "./routes/config"
 import { ExperimentalRoutes } from "./routes/experimental"
 import { ProviderRoutes } from "./routes/provider"
+// altimate_change start — OpenAI-compatible chat bridge for Open WebUI
+import { OpenAIRoutes } from "./routes/openai"
+// altimate_change end
 import { InstanceBootstrap } from "../project/bootstrap"
 import { NotFoundError } from "../storage/db"
 import type { ContentfulStatusCode } from "hono/utils/http-status"
@@ -215,6 +218,11 @@ export namespace Server {
       .all("/experimental/console/*", forwardHttpApiBridge)
       .all("/experimental/capabilities", forwardHttpApiBridge)
       .all("/experimental/session/:sessionID/background", forwardHttpApiBridge)
+      // altimate_change end
+      // altimate_change start — OpenAI-compatible bridge for Open WebUI. Mounted before the
+      // per-directory middleware because OWUI clients cannot send x-opencode-directory; the
+      // route establishes its own instance context from ALTIMATE_OWUI_PROJECT_DIR.
+      .route("/", OpenAIRoutes())
       // altimate_change end
       .route("/global", GlobalRoutes())
       .put(
