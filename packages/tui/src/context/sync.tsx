@@ -595,7 +595,13 @@ export const {
         .catch(() => undefined)
       const consoleStatePromise = sdk.client.experimental.console
         .get({ workspace }, { throwOnError: true })
-        .then((x) => x.data)
+        .then((x) => {
+          const data = x.data
+          // Guard against non-JSON success bodies (e.g. SPA HTML catch-all) that would
+          // otherwise reconcile into console_state and crash /connect + /models.
+          if (!data || !Array.isArray(data.consoleManagedProviders)) return emptyConsoleState
+          return data
+        })
         .catch(() => emptyConsoleState)
       const agentsPromise = sdk.client.app.agents({ workspace }, { throwOnError: true })
       const configPromise = sdk.client.config.get({ workspace }, { throwOnError: true })

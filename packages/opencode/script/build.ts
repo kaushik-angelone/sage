@@ -527,6 +527,13 @@ for (const item of targets) {
     await $`cp dist/${name}/bin/altimate dist/${name}/bin/altimate-code`.nothrow()
   }
 
+  // Bun's linker-signed Mach-O can be rejected on newer macOS (SIGKILL /
+  // Code Signature Invalid). Ad-hoc re-sign so local builds and install --binary work.
+  if (item.os === "darwin") {
+    await $`codesign --force --sign - dist/${name}/bin/altimate`.nothrow()
+    await $`codesign --force --sign - dist/${name}/bin/altimate-code`.nothrow()
+  }
+
   await $`rm -rf ./dist/${name}/bin/tui`
   await Bun.file(`dist/${name}/package.json`).write(
     JSON.stringify(

@@ -6,6 +6,7 @@ import { ProxyUtil } from "../proxy-util"
 import {
   embeddedAssetBytes,
   loadEmbeddedWebUI,
+  prefersHtmlNavigation,
   resolveEmbeddedAsset,
   type EmbeddedWebUI,
 } from "./embedded-web-ui"
@@ -69,8 +70,9 @@ export function serveEmbeddedUIEffect(
   requestPath: string,
   _fs: FSUtil.Interface,
   embeddedWebUI: EmbeddedWebUI,
+  options?: { spaFallback?: boolean },
 ) {
-  const hit = resolveEmbeddedAsset(embeddedWebUI, requestPath)
+  const hit = resolveEmbeddedAsset(embeddedWebUI, requestPath, options)
   if (!hit) return Effect.succeed(notFound())
   const body = embeddedAssetBytes(hit.asset)
   return Effect.succeed(embeddedUIResponse(hit.asset.mime, body))
@@ -84,7 +86,10 @@ export function serveUIEffect(
     const embeddedWebUI = yield* Effect.promise(() => embeddedUI(services.disableEmbeddedWebUi))
     const path = new URL(request.url, "http://localhost").pathname
 
-    if (embeddedWebUI) return yield* serveEmbeddedUIEffect(path, services.fs, embeddedWebUI)
+    if (embeddedWebUI) {
+      const spaFallback = prefersHtmlNavigation(request.headers.accept, request.method)
+      return yield* serveEmbeddedUIEffect(path, services.fs, embeddedWebUI, { spaFallback })
+    }
 
     const response = yield* services.client.execute(
       HttpClientRequest.make(request.method)(upstreamURL(path), {

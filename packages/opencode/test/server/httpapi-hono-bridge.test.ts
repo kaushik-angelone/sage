@@ -133,6 +133,29 @@ describe("Hono HttpApi bridge", () => {
     }),
   )
 
+  test("serves TUI console and capabilities HttpApi routes as JSON", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const headers = {
+      "x-opencode-directory": tmp.path,
+      accept: "application/json",
+    }
+
+    const consoleState = await app().request("/experimental/console", { headers })
+    expect(consoleState.status).toBe(200)
+    expect(consoleState.headers.get("content-type")).toContain("application/json")
+    expect(await consoleState.json()).toMatchObject({
+      consoleManagedProviders: expect.any(Array),
+      switchableOrgCount: expect.any(Number),
+    })
+
+    const capabilities = await app().request("/experimental/capabilities", { headers })
+    expect(capabilities.status).toBe(200)
+    expect(capabilities.headers.get("content-type")).toContain("application/json")
+    expect(await capabilities.json()).toMatchObject({
+      backgroundSubagents: expect.any(Boolean),
+    })
+  })
+
   test("serves TUI-used non-/api project, copy, control-plane, and sync routes", async () => {
     Flag.OPENCODE_EXPERIMENTAL_WORKSPACES = true
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })

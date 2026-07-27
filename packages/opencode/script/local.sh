@@ -59,6 +59,11 @@ if [ ! -f "$BINARY" ]; then
   exit 1
 fi
 
+# Newer macOS kills unsigned/linker-signed Bun binaries at launch.
+if [ "$OS" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$BINARY" >/dev/null 2>&1 || true
+fi
+
 # --- Run ---
 export NODE_PATH="$PKG_DIR/node_modules${NODE_PATH:+:$NODE_PATH}"
 # Use ${ARGS[@]+"${ARGS[@]}"} to avoid "unbound variable" on bash 3.2 (macOS default)

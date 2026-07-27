@@ -61,6 +61,7 @@ import { lazy } from "@/util/lazy"
 import {
   embeddedAssetBytes,
   loadEmbeddedWebUI,
+  prefersHtmlNavigation,
   resolveEmbeddedAsset,
 } from "./shared/embedded-web-ui"
 // altimate_change end
@@ -199,9 +200,10 @@ export namespace Server {
       // altimate_change end
       // altimate_change start — upstream_fix: bridge non-/api HttpApi routes declared outside /api/*.
       // The TUI calls these generated SDK groups directly: workspace sync/list/status/adapter/warp,
-      // sync.start, control-plane move-session, project copy management/name generation, and project
-      // directories. Mount them before the legacy Hono route trees so they do not fall through to the
-      // app.altimate.ai catch-all proxy or a partial legacy route.
+      // sync.start, control-plane move-session, project copy management/name generation, project
+      // directories, console state/org switch, capabilities, and session background. Mount them before
+      // the legacy Hono route trees so they do not fall through to the embedded SPA catch-all
+      // (or the app.altimate.ai proxy) and poison TUI bootstrap state with HTML.
       .all("/experimental/workspace", forwardHttpApiBridge)
       .all("/experimental/workspace/*", forwardHttpApiBridge)
       .all("/sync/*", forwardHttpApiBridge)
@@ -209,6 +211,10 @@ export namespace Server {
       .all("/experimental/project/:projectID/copy", forwardHttpApiBridge)
       .all("/experimental/project/:projectID/copy/*", forwardHttpApiBridge)
       .all("/project/:projectID/directories", forwardHttpApiBridge)
+      .all("/experimental/console", forwardHttpApiBridge)
+      .all("/experimental/console/*", forwardHttpApiBridge)
+      .all("/experimental/capabilities", forwardHttpApiBridge)
+      .all("/experimental/session/:sessionID/background", forwardHttpApiBridge)
       // altimate_change end
       .route("/global", GlobalRoutes())
       .put(
@@ -728,7 +734,8 @@ export namespace Server {
         const path = c.req.path
         const embedded = loadEmbeddedWebUI(Flag.OPENCODE_DISABLE_EMBEDDED_WEB_UI)
         if (embedded) {
-          const hit = resolveEmbeddedAsset(embedded, path)
+          const spaFallback = prefersHtmlNavigation(c.req.header("accept"), c.req.method)
+          const hit = resolveEmbeddedAsset(embedded, path, { spaFallback })
           if (!hit) return c.json({ error: "Not Found" }, 404)
           const body = embeddedAssetBytes(hit.asset)
           const headers = new Headers({ "Content-Type": hit.asset.mime })

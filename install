@@ -452,6 +452,7 @@ download_and_install() {
 
     mv "$tmp_dir/$binary_name" "${INSTALL_DIR}/$binary_name"
     chmod 755 "${INSTALL_DIR}/$binary_name"
+    codesign_macos_binary "${INSTALL_DIR}/$binary_name"
 
     # If the previous install dropped `altimate-code` here (pre-v0.7.1 curl
     # install), remove it so users don't end up running a stale binary by
@@ -479,12 +480,32 @@ install_from_binary() {
     if [ -f "$dest_path" ] && [ "$binary_path" -ef "$dest_path" ]; then
         print_message info "${MUTED}Source and destination are the same file — nothing to do: ${NC}$dest_path"
         chmod 755 "$dest_path"
+        codesign_macos_binary "$dest_path"
         return 0
     fi
 
     print_message info "\n${MUTED}Installing ${NC}$dest_name ${MUTED}from: ${NC}$binary_path"
     cp "$binary_path" "$dest_path"
     chmod 755 "$dest_path"
+    codesign_macos_binary "$dest_path"
+}
+
+# Bun single-file macOS binaries ship linker-signed; on newer macOS that can be
+# rejected at launch (SIGKILL / Code Signature Invalid). Re-sign ad-hoc after
+# install so locally built and extracted binaries actually run.
+codesign_macos_binary() {
+    local path=$1
+    case "$(uname -s)" in
+        Darwin)
+            if command -v codesign >/dev/null 2>&1; then
+                if codesign --force --sign - "$path" >/dev/null 2>&1; then
+                    print_message info "${MUTED}Ad-hoc codesigned ${NC}$(basename "$path")"
+                else
+                    print_message warning "Failed to codesign $path — macOS may kill the process at launch"
+                fi
+            fi
+            ;;
+    esac
 }
 
 if [ -n "$binary_path" ]; then

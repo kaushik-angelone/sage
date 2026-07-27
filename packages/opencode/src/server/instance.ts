@@ -36,6 +36,7 @@ import { errorHandler } from "./middleware"
 import {
   embeddedAssetBytes,
   loadEmbeddedWebUI,
+  prefersHtmlNavigation,
   resolveEmbeddedAsset,
 } from "./shared/embedded-web-ui"
 // altimate_change end
@@ -294,7 +295,8 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket, app: Hono = new Hono()
       const path = c.req.path
 
       if (embeddedWebUI) {
-        const hit = resolveEmbeddedAsset(embeddedWebUI, path)
+        const spaFallback = prefersHtmlNavigation(c.req.header("accept"), c.req.method)
+        const hit = resolveEmbeddedAsset(embeddedWebUI, path, { spaFallback })
         if (!hit) return c.json({ error: "Not Found" }, 404)
         const body = embeddedAssetBytes(hit.asset)
         const headers = new Headers({ "Content-Type": hit.asset.mime })
