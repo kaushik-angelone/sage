@@ -123,7 +123,7 @@ export function App() {
 
   const refreshSessions = useCallback(async (sdk: OpencodeClient) => {
     const res = await sdk.session.list({ limit: 100 })
-    if (res.error) throw new Error(typeof res.error === "string" ? res.error : "Failed to list sessions")
+    if (res.error) throw new Error("Failed to list sessions")
     const list = (res.data ?? []) as SessionInfo[]
     list.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
     setSessions(list)
