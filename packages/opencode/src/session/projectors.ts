@@ -1,4 +1,4 @@
-import { NotFoundError, eq, and } from "../storage/db"
+import { Database, NotFoundError, eq, and, sql } from "../storage/db"
 import { SyncEvent } from "@/sync"
 import { Session } from "./index"
 import { MessageV2 } from "./message-v2"
@@ -50,6 +50,14 @@ export function toPartialRow(info: DeepPartial<Session.Info>) {
     summary_deletions: grab(info, "summary", (v) => grab(v, "deletions")),
     summary_files: grab(info, "summary", (v) => grab(v, "files")),
     summary_diffs: grab(info, "summary", (v) => grab(v, "diffs")),
+    // altimate_change start — allow partial updates of aggregated usage
+    cost: grab(info, "cost"),
+    tokens_input: grab(info, "tokens", (v) => grab(v, "input")),
+    tokens_output: grab(info, "tokens", (v) => grab(v, "output")),
+    tokens_reasoning: grab(info, "tokens", (v) => grab(v, "reasoning")),
+    tokens_cache_read: grab(info, "tokens", (v) => grab(v, "cache", (c) => grab(c, "read"))),
+    tokens_cache_write: grab(info, "tokens", (v) => grab(v, "cache", (c) => grab(c, "write"))),
+    // altimate_change end
     revert: grab(info, "revert"),
     permission: grab(info, "permission"),
     time_created: grab(info, "time", (v) => grab(v, "created")),
@@ -116,6 +124,11 @@ export default [
     const { id, messageID, sessionID, ...rest } = data.part
 
     try {
+      // altimate_change start — keep SyncEvent.run path in sync with Session.updatePart usage rollup
+      const existing = db.select().from(PartTable).where(eq(PartTable.id, id)).get()
+      const previous = usageFromPart(existing?.data)
+      const next = usageFromPart(data.part)
+      // altimate_change end
       db.insert(PartTable)
         .values({
           id,
@@ -126,9 +139,56 @@ export default [
         })
         .onConflictDoUpdate({ target: PartTable.id, set: { data: rest } })
         .run()
+      // altimate_change start — applyUsage for SyncEvent.run (Session.updatePart already does this for Bus path)
+      if (previous) applyUsageRow(db, existing!.session_id, previous, -1)
+      if (next) applyUsageRow(db, sessionID, next, 1)
+      // altimate_change end
     } catch (err) {
       if (!foreign(err)) throw err
       log.warn("ignored late part update", { partID: id, messageID, sessionID })
     }
   }),
 ]
+
+// altimate_change start — step-finish usage helpers for SyncEvent projectors
+type Usage = {
+  cost: number
+  tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+}
+
+function usageFromPart(part: unknown): Usage | undefined {
+  if (typeof part !== "object" || part === null) return undefined
+  const value = part as Record<string, unknown>
+  if (value.type !== "step-finish") return undefined
+  if (typeof value.cost !== "number" || typeof value.tokens !== "object" || value.tokens === null) return undefined
+  const tokens = value.tokens as Record<string, unknown>
+  const cache = (tokens.cache ?? {}) as Record<string, unknown>
+  return {
+    cost: value.cost,
+    tokens: {
+      input: typeof tokens.input === "number" ? tokens.input : 0,
+      output: typeof tokens.output === "number" ? tokens.output : 0,
+      reasoning: typeof tokens.reasoning === "number" ? tokens.reasoning : 0,
+      cache: {
+        read: typeof cache.read === "number" ? cache.read : 0,
+        write: typeof cache.write === "number" ? cache.write : 0,
+      },
+    },
+  }
+}
+
+function applyUsageRow(db: Database.TxOrDb, sessionID: string, value: Usage, sign = 1) {
+  db.update(SessionTable)
+    .set({
+      cost: sql`${SessionTable.cost} + ${value.cost * sign}`,
+      tokens_input: sql`${SessionTable.tokens_input} + ${value.tokens.input * sign}`,
+      tokens_output: sql`${SessionTable.tokens_output} + ${value.tokens.output * sign}`,
+      tokens_reasoning: sql`${SessionTable.tokens_reasoning} + ${value.tokens.reasoning * sign}`,
+      tokens_cache_read: sql`${SessionTable.tokens_cache_read} + ${value.tokens.cache.read * sign}`,
+      tokens_cache_write: sql`${SessionTable.tokens_cache_write} + ${value.tokens.cache.write * sign}`,
+      time_updated: Date.now(),
+    })
+    .where(eq(SessionTable.id, sessionID as any))
+    .run()
+}
+// altimate_change end

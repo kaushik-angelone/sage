@@ -57,6 +57,13 @@ import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
 import { lazy } from "@/util/lazy"
+// altimate_change start — embedded web UI for catch-all static SPA
+import {
+  embeddedAssetBytes,
+  loadEmbeddedWebUI,
+  resolveEmbeddedAsset,
+} from "./shared/embedded-web-ui"
+// altimate_change end
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -716,8 +723,23 @@ export namespace Server {
         }
       })
       // altimate_change end
+      // altimate_change start — serve embedded SPA when gen assets exist; else proxy upstream
       .all("/*", async (c) => {
         const path = c.req.path
+        const embedded = loadEmbeddedWebUI(Flag.OPENCODE_DISABLE_EMBEDDED_WEB_UI)
+        if (embedded) {
+          const hit = resolveEmbeddedAsset(embedded, path)
+          if (!hit) return c.json({ error: "Not Found" }, 404)
+          const body = embeddedAssetBytes(hit.asset)
+          c.header("Content-Type", hit.asset.mime)
+          if (hit.asset.mime.startsWith("text/html")) {
+            c.header(
+              "Content-Security-Policy",
+              "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:",
+            )
+          }
+          return c.body(body)
+        }
 
         const response = await proxy(`https://app.altimate.ai${path}`, {
           ...c.req,
@@ -732,6 +754,7 @@ export namespace Server {
         )
         return response
       })
+      // altimate_change end
   }
 
   export async function openapi() {

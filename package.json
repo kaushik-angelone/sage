@@ -31,6 +31,7 @@
       "packages/server",
       "packages/tui",
       "packages/util",
+      "packages/web",
       "packages/sdk/js"
     ],
     "catalog": {

@@ -137,8 +137,9 @@ describe("ShareNext", () => {
         Effect.gen(function* () {
           const req = yield* svc.request()
 
-          // altimate fork rebrands the default share host
-          expect(req.baseUrl).toBe("https://altimate.ai")
+          // Share create/sync still uses OpenCode's public share host (opncd.ai).
+          // altimate.ai is the product marketing site and has no /api/share.
+          expect(req.baseUrl).toBe("https://opncd.ai")
           expect(req.api.create).toBe("/api/share")
           expect(req.headers).toEqual({})
         }),

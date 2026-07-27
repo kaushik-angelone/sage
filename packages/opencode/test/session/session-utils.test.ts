@@ -52,6 +52,13 @@ describe("Session.fromRow / toRow", () => {
       share: { url: "https://example.com/share/123" },
       revert: "snapshot_abc" as any,
       permission: "plan" as any,
+      cost: 1.25,
+      tokens: {
+        input: 100,
+        output: 50,
+        reasoning: 10,
+        cache: { read: 20, write: 5 },
+      },
       time: {
         created: 1700000000000,
         updated: 1700001000000,
@@ -75,6 +82,8 @@ describe("Session.fromRow / toRow", () => {
     expect(restored.share).toEqual(info.share)
     expect(restored.revert).toBe(info.revert)
     expect(restored.permission).toBe(info.permission)
+    expect(restored.cost).toBe(1.25)
+    expect(restored.tokens).toEqual(info.tokens)
     expect(restored.time.created).toBe(info.time.created)
     expect(restored.time.updated).toBe(info.time.updated)
     expect(restored.time.compacting).toBe(info.time.compacting)
@@ -98,6 +107,12 @@ describe("Session.fromRow / toRow", () => {
       share_url: null,
       revert: null,
       permission: null,
+      cost: 0,
+      tokens_input: 0,
+      tokens_output: 0,
+      tokens_reasoning: 0,
+      tokens_cache_read: 0,
+      tokens_cache_write: 0,
       time_created: 1,
       time_updated: 2,
       time_compacting: null,
@@ -109,6 +124,8 @@ describe("Session.fromRow / toRow", () => {
     expect(info.revert).toBeUndefined()
     expect(info.parentID).toBeUndefined()
     expect(info.workspaceID).toBeUndefined()
+    expect(info.cost).toBe(0)
+    expect(info.tokens).toEqual({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
     expect(info.time.compacting).toBeUndefined()
     expect(info.time.archived).toBeUndefined()
   })
@@ -130,6 +147,12 @@ describe("Session.fromRow / toRow", () => {
       share_url: null,
       revert: null,
       permission: null,
+      cost: 0.42,
+      tokens_input: 10,
+      tokens_output: 20,
+      tokens_reasoning: 0,
+      tokens_cache_read: 3,
+      tokens_cache_write: 1,
       time_created: 1,
       time_updated: 2,
       time_compacting: null,
@@ -140,5 +163,12 @@ describe("Session.fromRow / toRow", () => {
     expect(info.summary!.additions).toBe(5)
     expect(info.summary!.deletions).toBe(0)
     expect(info.summary!.files).toBe(0)
+    expect(info.cost).toBe(0.42)
+    expect(info.tokens).toEqual({
+      input: 10,
+      output: 20,
+      reasoning: 0,
+      cache: { read: 3, write: 1 },
+    })
   })
 })

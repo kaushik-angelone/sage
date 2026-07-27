@@ -38,6 +38,9 @@ Managed LLM access with dynamic routing across Sonnet 4.6, Opus 4.6, GPT-5.4, GP
 
 For pricing, security, and data handling details, see the [Altimate LLM Gateway guide](https://help.altimate.ai/datamates/user-guide/components/llm-gateway/).
 
+!!! note "Session cost display"
+    altimate-code reports **`$0` session cost** for `altimate-backend` / Altimate LLM Gateway requests. Gateway usage is billed on the Altimate side; the local TUI does not have per-token rates to estimate spend. Use a direct provider (Anthropic, OpenAI, Google, OpenRouter, etc.) when you want the sidebar `$ spent` total to reflect API pricing.
+
 !!! tip "Automatic model selection"
     When Altimate credentials are configured and no model is explicitly chosen, the Altimate LLM Gateway is selected automatically. You can override this by setting `model` in your config or by restricting the `provider` section to specific providers only.
 

@@ -86,6 +86,23 @@ if (Script.release && builtinSkills.length === 0) {
   process.exit(1)
 }
 
+// altimate_change start — build and inline the web MVP SPA into opencode-web-ui.gen.ts
+const skipWebUi = process.env.OPENCODE_SKIP_WEB_UI === "1" || process.env.OPENCODE_SKIP_WEB_UI === "true"
+if (!skipWebUi) {
+  console.log("Building embedded web UI…")
+  await $`bun install`.cwd(path.resolve(dir, "../web")).nothrow()
+  await $`bun run build`.cwd(path.resolve(dir, "../web"))
+  const genPath = path.join(dir, "src/generated/opencode-web-ui.gen.ts")
+  if (!fs.existsSync(genPath) || fs.readFileSync(genPath, "utf8").includes("assets: Record<string, EmbeddedAsset> | null = null")) {
+    console.error("error: web UI gen file missing or still a stub after build")
+    process.exit(1)
+  }
+  console.log("Embedded web UI gen ready")
+} else {
+  console.log("Skipping embedded web UI build (OPENCODE_SKIP_WEB_UI)")
+}
+// altimate_change end
+
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")

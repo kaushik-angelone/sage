@@ -58,7 +58,9 @@ export namespace ShareNext {
     const active = await Account.active()
     // altimate_change end
     if (!active?.active_org_id) {
-      const baseUrl = await Config.get().then((x) => x.enterprise?.url ?? "https://altimate.ai")
+      // altimate_change start — use OpenCode share host; altimate.ai is marketing-only (no /api/share)
+      const baseUrl = await Config.get().then((x) => x.enterprise?.url ?? "https://opncd.ai")
+      // altimate_change end
       return { headers, api: legacyApi, baseUrl }
     }
 

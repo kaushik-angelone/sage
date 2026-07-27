@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@altimateai/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && bun run script/generate-ui-gen.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "generate": "bun run script/generate-ui-gen.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "workspace:*",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "catalog:",
+    "vite": "^6.3.5"
+  }
+}

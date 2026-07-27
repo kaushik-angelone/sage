@@ -225,12 +225,31 @@ export namespace SystemPrompt {
     return v.filter((s) => typeof s === "string" && s.length > 0)
   }
 
+  /**
+   * Root directory for applyPaths auto-load scans.
+   *
+   * Non-git projects set `Instance.worktree` to `"/"` (see project.fromDirectory).
+   * Scanning from `/` walks the entire filesystem — observed as ~60s+ of
+   * bootstrap stall before the first LLM token on a bare "hi". Fall back to
+   * the session directory in that case, matching the sentinel already
+   * special-cased in `Instance.contains`.
+   */
+  export function skillAutoLoadRoot(
+    worktree: string = Instance.worktree,
+    directory: string = Instance.directory,
+  ): string | undefined {
+    if (worktree && worktree !== "/") return worktree
+    if (directory && directory !== "/") return directory
+    return undefined
+  }
+
   async function anyMatchInWorktree(globs: string[]): Promise<boolean> {
     // Search from worktree root so a skill that wants `dbt_project.yml`
     // catches the file no matter how deep the user's cwd is.
     // Errors propagate to the caller's try/catch (collectAutoLoadedSkills)
     // so the warning log there actually fires.
-    const root = Instance.worktree
+    const root = skillAutoLoadRoot()
+    if (!root) return false
     for (const g of globs) {
       const matches = await Glob.scan(g, {
         cwd: root,

@@ -3,8 +3,12 @@ import { Effect, Stream } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { createHash } from "node:crypto"
 import { ProxyUtil } from "../proxy-util"
-
-let embeddedUIPromise: Promise<Record<string, string> | null> | undefined
+import {
+  embeddedAssetBytes,
+  loadEmbeddedWebUI,
+  resolveEmbeddedAsset,
+  type EmbeddedWebUI,
+} from "./embedded-web-ui"
 
 // altimate_change start — hosted UI upstream branding
 export const UI_UPSTREAM = new URL("https://app.altimate.ai")
@@ -43,19 +47,17 @@ export function upstreamURL(path: string) {
   return new URL(path, UI_UPSTREAM).toString()
 }
 
+// altimate_change start — load inlined SPA assets from generated module
 export function embeddedUI(disableEmbeddedWebUi: boolean) {
-  if (disableEmbeddedWebUi) return Promise.resolve(null)
-  return (embeddedUIPromise ??=
-    // @ts-expect-error - generated file at build time
-    import("opencode-web-ui.gen.ts").then((module) => module.default as Record<string, string>).catch(() => null))
+  return Promise.resolve(loadEmbeddedWebUI(disableEmbeddedWebUi))
 }
+// altimate_change end
 
 function notFound() {
   return HttpServerResponse.jsonUnsafe({ error: "Not Found" }, { status: 404 })
 }
 
-function embeddedUIResponse(file: string, body: Uint8Array) {
-  const mime = FSUtil.mimeType(file)
+function embeddedUIResponse(mime: string, body: Uint8Array) {
   const headers = new Headers({ "content-type": mime })
   if (mime.startsWith("text/html")) {
     headers.set("content-security-policy", cspForHtml(new TextDecoder().decode(body)))
@@ -65,16 +67,13 @@ function embeddedUIResponse(file: string, body: Uint8Array) {
 
 export function serveEmbeddedUIEffect(
   requestPath: string,
-  fs: FSUtil.Interface,
-  embeddedWebUI: Record<string, string>,
+  _fs: FSUtil.Interface,
+  embeddedWebUI: EmbeddedWebUI,
 ) {
-  const file = embeddedWebUI[requestPath.replace(/^\//, "")] ?? embeddedWebUI["index.html"] ?? null
-  if (!file) return Effect.succeed(notFound())
-
-  return fs.readFile(file).pipe(
-    Effect.map((body) => embeddedUIResponse(file, body)),
-    Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(notFound())),
-  )
+  const hit = resolveEmbeddedAsset(embeddedWebUI, requestPath)
+  if (!hit) return Effect.succeed(notFound())
+  const body = embeddedAssetBytes(hit.asset)
+  return Effect.succeed(embeddedUIResponse(hit.asset.mime, body))
 }
 
 export function serveUIEffect(

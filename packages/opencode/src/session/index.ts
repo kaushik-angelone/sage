@@ -9,7 +9,7 @@ import { Config } from "../config/config"
 import { Flag } from "../flag/flag"
 import { Installation } from "../installation"
 
-import { Database, NotFoundError, eq, and, or, gte, isNull, desc, like, inArray, lt } from "../storage/db"
+import { Database, NotFoundError, eq, and, or, gte, isNull, desc, like, inArray, lt, sql } from "../storage/db"
 import type { SQL } from "../storage/db"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -57,6 +57,58 @@ export namespace Session {
 
   type SessionRow = typeof SessionTable.$inferSelect
 
+  // altimate_change start — session-level cost/tokens (rolled up from step-finish parts)
+  export type Tokens = {
+    input: number
+    output: number
+    reasoning: number
+    cache: { read: number; write: number }
+  }
+
+  export type Usage = {
+    cost: number
+    tokens: Tokens
+  }
+
+  const EmptyTokens: Tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+  function usageFromPartData(data: unknown): Usage | undefined {
+    if (typeof data !== "object" || data === null) return undefined
+    const value = data as Record<string, unknown>
+    if (value.type !== "step-finish") return undefined
+    if (typeof value.cost !== "number" || typeof value.tokens !== "object" || value.tokens === null) return undefined
+    const tokens = value.tokens as Record<string, unknown>
+    const cache = (tokens.cache ?? {}) as Record<string, unknown>
+    return {
+      cost: value.cost,
+      tokens: {
+        input: typeof tokens.input === "number" ? tokens.input : 0,
+        output: typeof tokens.output === "number" ? tokens.output : 0,
+        reasoning: typeof tokens.reasoning === "number" ? tokens.reasoning : 0,
+        cache: {
+          read: typeof cache.read === "number" ? cache.read : 0,
+          write: typeof cache.write === "number" ? cache.write : 0,
+        },
+      },
+    }
+  }
+
+  function applyUsage(db: Database.TxOrDb, sessionID: SessionID, value: Usage, sign = 1) {
+    db.update(SessionTable)
+      .set({
+        cost: sql`${SessionTable.cost} + ${value.cost * sign}`,
+        tokens_input: sql`${SessionTable.tokens_input} + ${value.tokens.input * sign}`,
+        tokens_output: sql`${SessionTable.tokens_output} + ${value.tokens.output * sign}`,
+        tokens_reasoning: sql`${SessionTable.tokens_reasoning} + ${value.tokens.reasoning * sign}`,
+        tokens_cache_read: sql`${SessionTable.tokens_cache_read} + ${value.tokens.cache.read * sign}`,
+        tokens_cache_write: sql`${SessionTable.tokens_cache_write} + ${value.tokens.cache.write * sign}`,
+        time_updated: Date.now(),
+      })
+      .where(eq(SessionTable.id, sessionID))
+      .run()
+  }
+  // altimate_change end
+
   export function fromRow(row: SessionRow): Info {
     const summary =
       row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
@@ -82,6 +134,18 @@ export namespace Session {
       title: row.title,
       version: row.version,
       summary,
+      // altimate_change start — expose aggregated session cost/tokens to API + TUI
+      cost: row.cost,
+      tokens: {
+        input: row.tokens_input,
+        output: row.tokens_output,
+        reasoning: row.tokens_reasoning,
+        cache: {
+          read: row.tokens_cache_read,
+          write: row.tokens_cache_write,
+        },
+      },
+      // altimate_change end
       share,
       revert,
       // altimate_change start — upstream_fix: core's SessionTable.permission column is typed
@@ -116,6 +180,14 @@ export namespace Session {
       summary_deletions: info.summary?.deletions,
       summary_files: info.summary?.files,
       summary_diffs: info.summary?.diffs,
+      // altimate_change start — persist aggregated session cost/tokens
+      cost: info.cost ?? 0,
+      tokens_input: (info.tokens ?? EmptyTokens).input,
+      tokens_output: (info.tokens ?? EmptyTokens).output,
+      tokens_reasoning: (info.tokens ?? EmptyTokens).reasoning,
+      tokens_cache_read: (info.tokens ?? EmptyTokens).cache.read,
+      tokens_cache_write: (info.tokens ?? EmptyTokens).cache.write,
+      // altimate_change end
       revert: info.revert ?? null,
       permission: info.permission,
       metadata: info.metadata,
@@ -170,6 +242,20 @@ export namespace Session {
         .optional(),
       title: z.string(),
       version: z.string(),
+      // altimate_change start — aggregated spend for TUI sidebar / GET /session
+      cost: z.number().optional(),
+      tokens: z
+        .object({
+          input: z.number(),
+          output: z.number(),
+          reasoning: z.number(),
+          cache: z.object({
+            read: z.number(),
+            write: z.number(),
+          }),
+        })
+        .optional(),
+      // altimate_change end
       time: z.object({
         created: z.number(),
         updated: z.number(),
@@ -352,6 +438,10 @@ export namespace Session {
       title: input.title ?? createDefaultTitle(!!input.parentID),
       permission: input.permission,
       metadata: input.metadata,
+      // altimate_change start — initialize aggregated usage
+      cost: 0,
+      tokens: { ...EmptyTokens, cache: { ...EmptyTokens.cache } },
+      // altimate_change end
       time: {
         created: Date.now(),
         updated: Date.now(),
@@ -762,17 +852,37 @@ export namespace Session {
       messageID: MessageID.zod,
     }),
     async (input) => {
-      // CASCADE delete handles parts automatically
       Database.use((db) => {
+        // altimate_change start — reverse step-finish usage before CASCADE deletes parts
+        const parts = db
+          .select()
+          .from(PartTable)
+          .where(and(eq(PartTable.message_id, input.messageID), eq(PartTable.session_id, input.sessionID)))
+          .all()
+        let usageChanged = false
+        for (const row of parts) {
+          const previous = usageFromPartData(row.data)
+          if (previous) {
+            applyUsage(db, input.sessionID, previous, -1)
+            usageChanged = true
+          }
+        }
+        // altimate_change end
         db.delete(MessageTable)
           .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
           .run()
-        Database.effect(() =>
+        const info = usageChanged
+          ? fromRow(db.select().from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get()!)
+          : undefined
+        Database.effect(() => {
           Bus.publish(MessageV2.Event.Removed, {
             sessionID: input.sessionID,
             messageID: input.messageID,
-          }),
-        )
+          })
+          // altimate_change start — live-update TUI session cost
+          if (info) Bus.publish(Event.Updated, { info })
+          // altimate_change end
+        })
       })
       return input.messageID
     },
@@ -786,16 +896,31 @@ export namespace Session {
     }),
     async (input) => {
       Database.use((db) => {
+        // altimate_change start — reverse usage when removing a step-finish part
+        const existing = db
+          .select()
+          .from(PartTable)
+          .where(and(eq(PartTable.id, input.partID), eq(PartTable.session_id, input.sessionID)))
+          .get()
+        const previous = existing && usageFromPartData(existing.data)
+        if (previous) applyUsage(db, input.sessionID, previous, -1)
+        // altimate_change end
         db.delete(PartTable)
           .where(and(eq(PartTable.id, input.partID), eq(PartTable.session_id, input.sessionID)))
           .run()
-        Database.effect(() =>
+        const info = previous
+          ? fromRow(db.select().from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get()!)
+          : undefined
+        Database.effect(() => {
           Bus.publish(MessageV2.Event.PartRemoved, {
             sessionID: input.sessionID,
             messageID: input.messageID,
             partID: input.partID,
-          }),
-        )
+          })
+          // altimate_change start — live-update TUI session cost
+          if (info) Bus.publish(Event.Updated, { info })
+          // altimate_change end
+        })
       })
       return input.partID
     },
@@ -807,6 +932,11 @@ export namespace Session {
     const { id, messageID, sessionID, ...data } = part
     const time = Date.now()
     Database.use((db) => {
+      // altimate_change start — roll step-finish cost/tokens into session aggregates
+      const existing = db.select().from(PartTable).where(eq(PartTable.id, id)).get()
+      const previous = existing && usageFromPartData(existing.data)
+      const next = usageFromPartData(part)
+      // altimate_change end
       db.insert(PartTable)
         .values({
           id,
@@ -817,13 +947,24 @@ export namespace Session {
         })
         .onConflictDoUpdate({ target: PartTable.id, set: { data } })
         .run()
-      Database.effect(() =>
+      // altimate_change start — apply delta so re-writes of the same part don't double-count
+      if (previous) applyUsage(db, sessionID, previous, -1)
+      if (next) applyUsage(db, sessionID, next, 1)
+      const info =
+        previous || next
+          ? fromRow(db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get()!)
+          : undefined
+      // altimate_change end
+      Database.effect(() => {
         Bus.publish(MessageV2.Event.PartUpdated, {
           sessionID: part.sessionID,
           part: structuredClone(part),
           time: Date.now(),
-        }),
-      )
+        })
+        // altimate_change start — publish session.updated so TUI sidebar refreshes $ spent
+        if (info) Bus.publish(Event.Updated, { info })
+        // altimate_change end
+      })
     })
     return part
   })

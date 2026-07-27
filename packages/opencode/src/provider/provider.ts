@@ -1436,6 +1436,8 @@ export namespace Provider {
           status: "active",
           headers: {},
           options: {},
+          // Pricing is intentionally $0: gateway bills separately (see docs/configure/providers.md).
+          // Session UI cost stays $0 for altimate-default; use a direct provider for $/token display.
           cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
           limit: { context: 200000, output: 128000 },
           capabilities: {

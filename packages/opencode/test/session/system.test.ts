@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import type { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -80,5 +80,69 @@ describe("session.system", () => {
         expect(output).not.toContain("manual-skill")
       }),
     { init: writeSkillFixtures },
+  )
+
+  // Non-git projects set worktree to "/". applyPaths must not scan from "/".
+  test("skillAutoLoadRoot falls back to directory when worktree is filesystem root", () => {
+    expect(SystemPrompt.skillAutoLoadRoot("/", "/tmp/project")).toBe("/tmp/project")
+    expect(SystemPrompt.skillAutoLoadRoot("/repo", "/tmp/project")).toBe("/repo")
+    expect(SystemPrompt.skillAutoLoadRoot("/", "/")).toBeUndefined()
+  })
+
+  it.instance(
+    "applyPaths auto-load stays fast when worktree is / (non-git project)",
+    () =>
+      Effect.gen(function* () {
+        const started = Date.now()
+        const prompt = yield* SystemPrompt.Service
+        const output = yield* prompt.skills(build)
+        const elapsed = Date.now() - started
+        // Regression: scanning applyPaths from "/" previously took 60s+.
+        expect(elapsed).toBeLessThan(5_000)
+        expect(output).toContain("<name>apply-path-skill</name>")
+        // File lives under the session directory; auto-load should still find it.
+        expect(output).toContain('<auto_loaded_skill name="apply-path-skill">')
+      }),
+    {
+      // default git:false → Instance.worktree === "/"
+      init: (directory: string) =>
+        Effect.promise(async () => {
+          for (const skill of skills) {
+            const dir = path.join(directory, ".opencode", "skill", skill.name)
+            await fs.mkdir(dir, { recursive: true })
+            await Bun.write(
+              path.join(dir, "SKILL.md"),
+              [
+                "---",
+                `name: ${skill.name}`,
+                skill.description ? `description: ${skill.description}` : undefined,
+                "---",
+                "",
+                `# ${skill.name}`,
+                "",
+              ]
+                .filter((line) => line !== undefined)
+                .join("\n"),
+            )
+          }
+          const dir = path.join(directory, ".opencode", "skill", "apply-path-skill")
+          await fs.mkdir(dir, { recursive: true })
+          await Bun.write(
+            path.join(dir, "SKILL.md"),
+            [
+              "---",
+              "name: apply-path-skill",
+              "description: Auto-load probe skill.",
+              "applyPaths:",
+              "  - dbt_project.yml",
+              "---",
+              "",
+              "# apply-path-skill",
+              "",
+            ].join("\n"),
+          )
+          await Bun.write(path.join(directory, "dbt_project.yml"), "name: probe\n")
+        }),
+    },
   )
 })
