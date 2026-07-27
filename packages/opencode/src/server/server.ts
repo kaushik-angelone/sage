@@ -731,14 +731,14 @@ export namespace Server {
           const hit = resolveEmbeddedAsset(embedded, path)
           if (!hit) return c.json({ error: "Not Found" }, 404)
           const body = embeddedAssetBytes(hit.asset)
-          c.header("Content-Type", hit.asset.mime)
+          const headers = new Headers({ "Content-Type": hit.asset.mime })
           if (hit.asset.mime.startsWith("text/html")) {
-            c.header(
+            headers.set(
               "Content-Security-Policy",
               "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:",
             )
           }
-          return c.body(body)
+          return new Response(Buffer.from(body), { status: 200, headers })
         }
 
         const response = await proxy(`https://app.altimate.ai${path}`, {

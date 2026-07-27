@@ -297,11 +297,11 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket, app: Hono = new Hono()
         const hit = resolveEmbeddedAsset(embeddedWebUI, path)
         if (!hit) return c.json({ error: "Not Found" }, 404)
         const body = embeddedAssetBytes(hit.asset)
-        c.header("Content-Type", hit.asset.mime)
+        const headers = new Headers({ "Content-Type": hit.asset.mime })
         if (hit.asset.mime.startsWith("text/html")) {
-          c.header("Content-Security-Policy", DEFAULT_CSP)
+          headers.set("Content-Security-Policy", DEFAULT_CSP)
         }
-        return c.body(body)
+        return new Response(Buffer.from(body), { status: 200, headers })
       } else {
         const response = await proxy(`https://app.altimate.ai${path}`, {
           ...c.req,
