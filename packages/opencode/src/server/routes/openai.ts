@@ -20,6 +20,8 @@
 //   ALTIMATE_OWUI_AGENT        Agent to run (optional; uses the session default otherwise).
 //   ALTIMATE_OWUI_PERMISSION   "approve" (default) auto-approves tool permission
 //                              requests with reply "once"; anything else rejects.
+//   ALTIMATE_OWUI_SESSION_MAP  Optional path for chat→session persistence
+//                              (default: <$XDG_DATA_HOME>/altimate-code/owui-chat-sessions.json).
 import { Hono } from "hono"
 import { streamSSE } from "hono/streaming"
 import { lazy } from "../../util/lazy"
@@ -34,11 +36,26 @@ import { WorkspaceContext } from "../../control-plane/workspace-context"
 import { InstanceBootstrap } from "../../project/bootstrap"
 import { Filesystem } from "@/util/filesystem"
 import type { SessionID } from "@/session/schema"
+import {
+  deleteMappedSession,
+  getMappedSession,
+  setMappedSession,
+} from "./owui-session-map"
+import { setOwuiTraceContext } from "./owui-trace-context"
 
 const log = Log.create({ service: "openai-bridge" })
 
 function modelID() {
   return process.env["ALTIMATE_OWUI_MODEL"] || "altimate-code"
+}
+
+/** Same as data-agent owui_client_v5: X-OpenWebUI-User-Email, else anonymous. */
+function owuiUserId(c: { req: { header: (name: string) => string | undefined } }): string {
+  const email = (c.req.header("x-openwebui-user-email") || "").trim()
+  if (email) return email
+  const name = (c.req.header("x-openwebui-user-name") || c.req.header("x-openwebui-user-id") || "").trim()
+  if (name) return name
+  return crypto.randomUUID()
 }
 
 function decode(value: string) {
@@ -54,12 +71,6 @@ function resolveDirectory(headerDir: string | undefined) {
     process.env["ALTIMATE_OWUI_PROJECT_DIR"] || process.env["OPENCODE_PROJECT_DIR"] || headerDir || process.cwd()
   return Filesystem.resolve(decode(raw))
 }
-
-// chatKey -> sessionID. Keeps an Open WebUI conversation pinned to one
-// altimate-code session so multi-turn context is preserved. Sessions are
-// persisted by altimate-code itself; this map only survives the server process,
-// which is enough since OWUI sends the same chat id on every turn.
-const chatSessions = new Map<string, SessionID>()
 
 function coerceContent(content: unknown): string {
   if (typeof content === "string") return content
@@ -84,15 +95,17 @@ function lastUserMessage(messages: Array<{ role?: string; content?: unknown }>):
 }
 
 async function resolveSession(chatKey: string, firstMessage: string): Promise<SessionID> {
-  const existing = chatSessions.get(chatKey)
+  // Disk-backed map so OWUI chats resume the same altimate session after
+  // `run.sh` / serve restarts (session messages live in SQLite separately).
+  const existing = getMappedSession(chatKey)
   if (existing) {
     const still = await Session.get(existing).catch(() => undefined)
     if (still) return existing
-    chatSessions.delete(chatKey)
+    deleteMappedSession(chatKey)
   }
   const title = firstMessage ? firstMessage.slice(0, 80) : "Open WebUI chat"
   const session = await Session.create({ title })
-  chatSessions.set(chatKey, session.id)
+  setMappedSession(chatKey, session.id)
   return session.id
 }
 
@@ -306,15 +319,18 @@ export const OpenAIRoutes = lazy(() =>
     .post("/v1/chat/completions", async (c) => {
       const body = await c.req.json().catch(() => ({}) as any)
       const messages: Array<{ role?: string; content?: unknown }> = Array.isArray(body?.messages) ? body.messages : []
-      const model = typeof body?.model === "string" && body.model ? body.model : modelID()
+      // Always advertise the portable's configured model id (builder vs analyst).
+      const model = modelID()
       const wantStream = body?.stream !== false
       const agent = process.env["ALTIMATE_OWUI_AGENT"] || undefined
 
       const chatId = (c.req.header("x-openwebui-chat-id") || c.req.header("x-chat-id") || "").trim()
+      const userId = owuiUserId(c)
       const userMessage = lastUserMessage(messages)
 
       const directory = Instance.directory
-      const chatKey = `${directory}::${chatId || crypto.randomUUID()}`
+      // Include user (like data-agent session keying) so chats don't collide across users.
+      const chatKey = `${directory}::${userId}::${chatId || crypto.randomUUID()}`
 
       if (!userMessage) {
         return c.json({
@@ -327,6 +343,12 @@ export const OpenAIRoutes = lazy(() =>
       }
 
       const sessionID = await resolveSession(chatKey, userMessage)
+      // Stash before firePrompt so TraceConsumer can attach user/model on first events.
+      setOwuiTraceContext(sessionID, {
+        userId,
+        modelId: model,
+        agent: agent || undefined,
+      })
       const completionID = `chatcmpl-${sessionID}`
 
       const firePrompt = () =>

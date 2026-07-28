@@ -28,10 +28,11 @@ import { format } from "node:util"
 import { xdgData } from "xdg-basedir"
 
 // Compute the log dir inline (no heavy imports that might log before the redirect is up).
-// Mirrors @opencode-ai/core/global Path.log: <xdgData>/opencode/log.
+// Mirrors packages/core Global.Path.log: ALTIMATE_LOG_DIR | OPENCODE_LOG_DIR | <xdgData>/altimate-code/log.
 function logFilePath(): string {
+  const override = process.env["ALTIMATE_LOG_DIR"] || process.env["OPENCODE_LOG_DIR"]
   const base = xdgData ?? path.join(os.homedir(), ".local", "share")
-  const dir = path.join(base, "opencode", "log")
+  const dir = override || path.join(base, "altimate-code", "log")
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `tui-worker-${process.pid}.log`)
 }

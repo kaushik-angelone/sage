@@ -40,9 +40,16 @@ Admin Panel -> Settings -> Connections -> add an **OpenAI API** connection:
 
 The `altimate-code` model should now appear in the model picker.
 
-> Session continuity relies on Open WebUI forwarding the `X-OpenWebUI-Chat-Id`
-> header. Enable "Forward User Info Headers" in Open WebUI so each chat maps to a
-> stable sage session.
+> Enable **Forward User Info Headers** in Open WebUI. The bridge uses:
+>
+> - `X-OpenWebUI-Chat-Id` — session continuity (persisted to
+>   `$XDG_DATA_HOME/altimate-code/owui-chat-sessions.json`)
+> - `X-OpenWebUI-User-Email` — Langfuse / trace `userId` (same as data-agent
+>   `owui_client_v5.py`)
+>
+> Set `ALTIMATE_OWUI_MODEL` / `ALTIMATE_OWUI_AGENT` per portable instance so
+> `/v1/models` and Langfuse tags distinguish builder vs analyst (e.g.
+> `altimate-builder` + `builder`).
 
 ## 3. Install the filter
 

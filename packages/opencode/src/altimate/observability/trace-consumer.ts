@@ -26,13 +26,14 @@
  *   - cli/cmd/tui/worker.ts — feeds events from its own SDK event loop
  *   - cli/cmd/serve.ts      — uses subscribeTraceConsumer() below
  */
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Config } from "@/config/config"
 import { Log } from "@/altimate/util/log"
-import { Server } from "@/server/server"
-import { Flag } from "@opencode-ai/core/flag/flag"
+import { GlobalBus } from "@/bus/global"
+import { AsyncQueue } from "@/util/queue"
 import { Trace, FileExporter, HttpExporter, type TraceExporter } from "./tracing"
+import { appendLangfuseExporter } from "./langfuse"
+import { clearOwuiTraceContext, getOwuiTraceContext } from "@/server/routes/owui-trace-context"
 
 const MAX_TRACES = 100
 
@@ -94,7 +95,8 @@ export class TraceConsumer {
           exporters.push(new HttpExporter(exp.name, exp.endpoint, exp.headers))
         }
       }
-      this.exporters = exporters
+      // Langfuse when LANGFUSE_* env is set (also re-attached in Trace.withExporters).
+      this.exporters = appendLangfuseExporter(exporters)
       this.maxFiles = tc?.maxFiles
     } catch (error) {
       // Config failure must not prevent the host (TUI/serve) from tracing:
@@ -138,6 +140,9 @@ export class TraceConsumer {
       if (!(await trace.rehydrateFromFile(sessionID))) {
         trace.startTrace(sessionID, {})
       }
+      // OWUI bridge may have already stashed user/model for this session.
+      const owui = getOwuiTraceContext(sessionID)
+      if (owui) trace.applyOwuiContext(owui)
       // If a reset() replaced our stream while we were awaiting rehydrate, this
       // Trace belongs to a stream that's already torn down and its cache
       // cleared. Inserting it now would resurrect an orphan writer into the
@@ -161,6 +166,12 @@ export class TraceConsumer {
       })
       return null
     }
+  }
+
+  private applyOwuiContext(sessionID: string | undefined, trace: Trace | null | undefined) {
+    if (!sessionID || !trace) return
+    const owui = getOwuiTraceContext(sessionID)
+    if (owui) trace.applyOwuiContext(owui)
   }
 
   /** Feed one bus event into the per-session traces. Never throws. */
@@ -193,12 +204,14 @@ export class TraceConsumer {
               this.sessionUserMsgIds.get(resolvedSessionID)!.add(info.id)
             }
             if (trace) {
+              this.applyOwuiContext(resolvedSessionID, trace)
               const title = info.summary?.title || info.summary?.body
               if (title) trace.setTitle(String(title).slice(0, 80), String(title))
             }
           }
           if (info.role === "assistant") {
             const r = trace ?? (await this.getOrCreateTrace(resolvedSessionID))
+            this.applyOwuiContext(resolvedSessionID, r)
             r?.enrichFromAssistant({
               modelID: info.modelID,
               providerID: info.providerID,
@@ -213,6 +226,7 @@ export class TraceConsumer {
         if (part) {
           // Create trace on first event for this session (lazy creation)
           const trace = this.sessionTraces.get(part.sessionID) ?? (await this.getOrCreateTrace(part.sessionID))
+          this.applyOwuiContext(part.sessionID, trace)
           if (trace) {
             if (part.type === "step-start") trace.logStepStart(part as Parameters<Trace["logStepStart"]>[0])
             if (part.type === "step-finish") trace.logStepFinish(part as Parameters<Trace["logStepFinish"]>[0])
@@ -283,14 +297,20 @@ export class TraceConsumer {
           if (trace) void trace.endTrace().catch(() => {})
           this.sessionTraces.delete(info.id)
           this.sessionUserMsgIds.delete(info.id)
+          clearOwuiTraceContext(info.id)
         }
       }
-      // DO NOT finalize the trace on session.status=idle. `idle` fires after
-      // every turn (busy → idle), not at session end. Finalizing per-turn would
-      // treat each turn as session end and the next turn's events would hit a
-      // cache miss; getOrCreateTrace rehydrates from disk as defense in depth,
-      // but the correct behaviour is to keep the Trace live across turns and
-      // finalize only on flush() (shutdown) and MAX_TRACES eviction.
+      // DO NOT finalize the local file trace on session.status=idle — idle is
+      // per-turn, not session end. But live remote exporters (Langfuse) need a
+      // push each turn; without this, serve/OWUI only exports on shutdown.
+      if (e.type === "session.status") {
+        const sessionID = e.properties?.sessionID as string | undefined
+        const status = e.properties?.status as { type?: string } | undefined
+        if (sessionID && status?.type === "idle") {
+          const trace = this.sessionTraces.get(sessionID)
+          if (trace) void trace.exportRemotes().catch(() => {})
+        }
+      }
     } catch (error) {
       // Trace must never interrupt event forwarding — log at debug only.
       Log.Default.debug("[tracing] handleEvent error", {
@@ -379,35 +399,43 @@ export function subscribeTraceConsumer(
   const abort = new AbortController()
   const signal = abort.signal
 
-  // Default event source: the in-process SDK subscription — same pattern as the
-  // TUI worker. The Bus is process-wide, so events published by sessions served
-  // by the TCP listener arrive on this subscription too. The SDK client is
-  // built once; `subscribe` is invoked per (re)connect.
+  // Default event source: GlobalBus (process-wide), same as the TUI worker.
+  //
+  // IMPORTANT: do NOT use the per-directory SDK `/event` subscription here.
+  // Instance Bus is scoped to one project directory. `serve` often starts with
+  // cwd=portable root while OWUI sessions run under ALTIMATE_OWUI_PROJECT_DIR
+  // (altimate_context) — those session events never reach a cwd-scoped
+  // subscriber, so Langfuse/file traces stayed empty. GlobalBus carries every
+  // instance's publishes (see Bus.publish → GlobalBus.emit).
+  void input.directory // retained for API compat / future directory filters
   const subscribe =
     options?.subscribe ??
-    (() => {
-      const fetchFn = (async (fetchInput: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(fetchInput, init)
-        const password = Flag.OPENCODE_SERVER_PASSWORD
-        if (password) {
-          const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
-          request.headers.set("Authorization", `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`)
+    ((sig: AbortSignal): Promise<TraceEventSource | undefined> => {
+      const q = new AsyncQueue<BusEventLike | null>()
+      const onEvent = (event: { payload?: BusEventLike }) => {
+        if (event?.payload) q.push(event.payload)
+      }
+      GlobalBus.on("event", onEvent)
+      const onAbort = () => {
+        GlobalBus.off("event", onEvent)
+        q.push(null)
+      }
+      if (sig.aborted) onAbort()
+      else sig.addEventListener("abort", onAbort, { once: true })
+
+      async function* stream() {
+        try {
+          for await (const item of q) {
+            if (item === null) return
+            yield item
+          }
+        } finally {
+          GlobalBus.off("event", onEvent)
+          sig.removeEventListener("abort", onAbort)
         }
-        return Server.Default().fetch(request)
-      }) as typeof globalThis.fetch
-
-      const sdk = createOpencodeClient({
-        baseUrl: "http://altimate-code.internal",
-        directory: input.directory,
-        fetch: fetchFn,
-        signal,
-      })
-
-      return (sig: AbortSignal): Promise<TraceEventSource | undefined> =>
-        Promise.resolve(sdk.event.subscribe({}, { signal: sig }))
-          .then((r) => r as unknown as TraceEventSource)
-          .catch(() => undefined)
-    })()
+      }
+      return Promise.resolve({ stream: stream() })
+    })
 
   // Abortable sleep so a pending reconnect-backoff doesn't delay shutdown.
   const BASE_BACKOFF_MS = 250

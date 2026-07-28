@@ -43,10 +43,13 @@ export const ServeCommand = effectCmd({
     // event stream so serve sessions produce the same trace files as the
     // terminal entrypoints.
     //
-    // `directory` is the SDK workspace/routing context, NOT the trace output
-    // location — trace files always go to the configured tracing dir
-    // (`tracing.dir`, default ~/.local/share/altimate-code/traces/).
-    const traceSub = subscribeTraceConsumer({ directory: process.cwd() })
+    // `directory` is advisory (GlobalBus is process-wide). Prefer the OWUI
+    // project dir when set so logs/diagnostics match the agent workspace.
+    const traceDirectory =
+      process.env["ALTIMATE_OWUI_PROJECT_DIR"] ||
+      process.env["OPENCODE_PROJECT_DIR"] ||
+      process.cwd()
+    const traceSub = subscribeTraceConsumer({ directory: traceDirectory })
 
     // altimate_change start — self-update on startup
     // A headless `serve` is how the VS Code / Cursor extension runs

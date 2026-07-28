@@ -28,6 +28,7 @@ import { BashTool } from "../../tool/bash"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "../../util/locale"
 import { Tracer, FileExporter, HttpExporter, type TraceExporter } from "../../altimate/observability/tracing"
+import { appendLangfuseExporter } from "../../altimate/observability/langfuse"
 // altimate_change start — upstream_fix: type-only import for the tracing-config cast (see tracer setup below)
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 // altimate_change end
@@ -621,7 +622,9 @@ You are speaking to a non-technical business executive. Follow these rules stric
             }
           }
 
-          return Tracer.withExporters(exporters, { maxFiles: tracingCfg?.maxFiles })
+          return Tracer.withExporters(appendLangfuseExporter(exporters), {
+            maxFiles: tracingCfg?.maxFiles,
+          })
         } catch {
           // Config failure should never prevent the run command from working
           return null
