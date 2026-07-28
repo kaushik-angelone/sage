@@ -9,7 +9,8 @@
 //
 // Streamed chunks carry the same custom `message_type` tags that the ADK shim
 // emits ("text", "tool call", "tool response") so the existing Open WebUI filter
-// function renders tool activity identically.
+// function renders tool activity identically. Reasoning parts stream as
+// `delta.reasoning_content` for Open WebUI's native Thought collapsible.
 //
 // Configuration (env):
 //   ALTIMATE_OWUI_PROJECT_DIR  Absolute path of the repo the agent operates on.
@@ -95,13 +96,13 @@ async function resolveSession(chatKey: string, firstMessage: string): Promise<Se
   return session.id
 }
 
-type EmitKind = "text" | "tool_call" | "tool_done"
+type EmitKind = "text" | "reasoning" | "tool_call" | "tool_done"
 
 function chunk(input: {
   id: string
   model: string
   author: string
-  messageType: "text" | "tool call" | "tool response"
+  messageType: "text" | "reasoning" | "tool call" | "tool response"
   delta: Record<string, unknown>
   finishReason?: string | null
   overallDuration?: number
@@ -142,6 +143,9 @@ function consumeSession(input: {
   const finalizedTextParts = new Set<string>()
   const emittedToolCall = new Set<string>()
   const emittedToolDone = new Set<string>()
+  // Deltas can race ahead of the part.updated that classifies a part as
+  // text vs reasoning. Buffer until we know which emit kind to use.
+  const pendingDeltas = new Map<string, string[]>()
   let sawActivity = false
 
   let resolveDone: () => void
@@ -151,15 +155,37 @@ function consumeSession(input: {
 
   const permissionMode = (process.env["ALTIMATE_OWUI_PERMISSION"] || "approve").toLowerCase()
 
+  const flushPending = (partID: string, kind: "text" | "reasoning") => {
+    const buffered = pendingDeltas.get(partID)
+    if (!buffered?.length) {
+      pendingDeltas.delete(partID)
+      return
+    }
+    pendingDeltas.delete(partID)
+    for (const delta of buffered) emit(kind, { content: delta })
+  }
+
   const unsubscribe = Bus.subscribeAll((event: { type: string; properties: any }) => {
     const props = event.properties ?? {}
 
     if (event.type === "message.part.delta") {
       if (props.sessionID !== sessionID || props.field !== "text") return
-      if (reasoningParts.has(props.partID)) return // don't stream chain-of-thought
       sawActivity = true
       deltaStreamedParts.add(props.partID)
-      if (props.delta) emit("text", { content: props.delta })
+      if (!props.delta) return
+      // Reasoning parts share field "text" deltas; map them to OWUI's native
+      // reasoning_content so the Thought collapsible can render them.
+      if (reasoningParts.has(props.partID)) {
+        emit("reasoning", { content: props.delta })
+        return
+      }
+      if (textParts.has(props.partID)) {
+        emit("text", { content: props.delta })
+        return
+      }
+      const queue = pendingDeltas.get(props.partID) ?? []
+      queue.push(props.delta)
+      pendingDeltas.set(props.partID, queue)
       return
     }
 
@@ -170,6 +196,7 @@ function consumeSession(input: {
 
       if (part.type === "text") {
         textParts.add(part.id)
+        flushPending(part.id, "text")
         if (part.time?.end && !deltaStreamedParts.has(part.id) && !finalizedTextParts.has(part.id)) {
           finalizedTextParts.add(part.id)
           const text = (part.text ?? "").trim()
@@ -180,6 +207,13 @@ function consumeSession(input: {
 
       if (part.type === "reasoning") {
         reasoningParts.add(part.id)
+        flushPending(part.id, "reasoning")
+        // Fallback when deltas were missed (e.g. subscriber attached mid-turn).
+        if (part.time?.end && !deltaStreamedParts.has(part.id) && !finalizedTextParts.has(part.id)) {
+          finalizedTextParts.add(part.id)
+          const text = (part.text ?? "").trim()
+          if (text) emit("reasoning", { content: text })
+        }
         return
       }
 
@@ -371,6 +405,18 @@ export const OpenAIRoutes = lazy(() =>
                   author: "assistant",
                   messageType: "text",
                   delta: { content: payload.content },
+                }),
+              )
+              return
+            }
+            if (kind === "reasoning" && payload.content) {
+              void write(
+                chunk({
+                  id: completionID,
+                  model,
+                  author: "assistant",
+                  messageType: "reasoning",
+                  delta: { reasoning_content: payload.content },
                 }),
               )
               return

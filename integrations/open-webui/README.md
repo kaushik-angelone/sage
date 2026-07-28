@@ -55,7 +55,8 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 | --- | --- |
 | tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. |
 | tool response (`{"name","duration"}`) | Dropped (kept out of the message body). |
-| plain text | Forwarded to the message body unchanged. |
+| reasoning (`delta.reasoning_content`) | Forwarded for Open WebUI’s native Thought collapsible. |
+| plain text | Forwarded; if a chunk starts with a markdown block marker (`#`, `-`, `*`, …) and the previous chunk ended with a full stop (`.`), a newline is prefixed. |
 | completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. |
 | error | Emits a "❌ Error occurred." pill. |
 

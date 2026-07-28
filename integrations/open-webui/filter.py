@@ -8,13 +8,20 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
                                       friendly label + argument preview, and the
                                       raw JSON chunk is dropped from the message.
   * `message_type: "tool response"` -> dropped (kept out of the message body).
-  * `message_type: "text"`        -> forwarded to the message body unchanged.
+  * `message_type: "text"`        -> forwarded to the message body; if a chunk
+                                      starts with a markdown block marker (#, -,
+                                      *, >, `, |, …) and the previous chunk ended
+                                      with a full stop (.), a newline is prefixed
+                                      so headings/lists don't glue mid-line.
+  * reasoning deltas              -> forwarded as `delta.reasoning_content` for
+                                      Open WebUI's native Thought collapsible.
   * completion sentinel           -> a "Complete in Xs" done status pill.
   * `message_type: "error"`       -> an error status pill.
 
 The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):
   - tool call:     delta.content = JSON {"name": <tool>, "args": {...}}
   - tool response: delta.content = JSON {"name": <tool>, "duration": <seconds>}
+  - reasoning:     delta.reasoning_content = <thought text>
   - final chunk:   choices[0].finish_reason = "stop",
                    choices[0].stream_complete = true,
                    choices[0].overall_duration = <seconds>
@@ -116,6 +123,10 @@ GENERIC_PREVIEW_KEYS = (
     "name",
 )
 
+# Block-level markdown starters that look broken when glued onto the previous
+# streamed token (e.g. "done.# Heading" → "done.\n# Heading").
+_MD_LINE_STARTERS = ("#", "-", "*", "+", ">", "|", "`", "=", "~")
+
 
 def _fmt_duration(duration: object) -> str:
     if duration is None:
@@ -138,6 +149,41 @@ class Filter:
         self._complete_emitted = False
         self._started_at = None
         self._revealed = set()
+        self._prev_ends_with_full_stop = False
+
+    @staticmethod
+    def _starts_markdown_line(text: str) -> bool:
+        if not text or text.startswith("\n"):
+            return False
+        return text[0] in _MD_LINE_STARTERS
+
+    def _ensure_markdown_newline(self, text: str) -> str:
+        """Prefix a newline when markdown follows a sentence-ending full stop."""
+        if not isinstance(text, str) or not text:
+            return text
+        out = text
+        if self._starts_markdown_line(text) and self._prev_ends_with_full_stop:
+            out = "\n" + text
+        # Ignore trailing whitespace/newlines when detecting a sentence end.
+        self._prev_ends_with_full_stop = text.rstrip().endswith(".")
+        return out
+
+    def _rewrite_delta_content(self, event: dict, original: str, updated: str) -> dict:
+        if original == updated:
+            return event
+        choices = event.get("choices") or []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            if delta.get("content") == original:
+                delta = dict(delta)
+                delta["content"] = updated
+                choice["delta"] = delta
+                break
+        return event
 
     def _mark_started(self) -> None:
         # First activity of the turn — used to compute elapsed time as a fallback
@@ -250,24 +296,37 @@ class Filter:
         self._mark_started()
         return body
 
+    @staticmethod
+    def _reasoning_delta(delta: dict) -> Optional[str]:
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = delta.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     async def stream(self, event: dict, __event_emitter__=None) -> Optional[dict]:
         self._mark_started()
         choices = event.get("choices", []) or []
 
         # Collect any text content in this chunk.
         contents = []
+        has_reasoning = False
         for choice in choices:
             delta = choice.get("delta", {}) or {}
             if "content" in delta and delta.get("content") is not None:
                 contents.append(delta["content"])
+            if self._reasoning_delta(delta):
+                has_reasoning = True
         text = contents[0] if contents else ""
 
         message_type = event.get("message_type")
 
         # Completion sentinel: no content, but the bridge flagged the turn done.
+        # Do not treat reasoning-only chunks as completion.
         first_choice = choices[0] if choices else {}
         is_complete_sentinel = bool(first_choice.get("stream_complete")) or (
             not str(text).strip()
+            and not has_reasoning
             and (
                 "overall_duration" in first_choice
                 or first_choice.get("finish_reason") == "stop"
@@ -278,6 +337,10 @@ class Filter:
                 first_choice.get("overall_duration", 0), __event_emitter__
             )
             return None
+
+        # Native Thought UI: forward reasoning_content / reasoning / thinking.
+        if has_reasoning:
+            return event
 
         # Tool call / response: detect from the JSON content directly so it works
         # regardless of whether Open WebUI forwarded the `message_type` hint.
@@ -305,8 +368,10 @@ class Filter:
         if not str(text).strip():
             return None
 
-        # Plain assistant text (and everything else) is forwarded unchanged.
-        return event
+        # Keep markdown block markers (# headings, lists, fences, …) on their
+        # own line when the model streams them stuck to the previous token.
+        fixed = self._ensure_markdown_newline(str(text))
+        return self._rewrite_delta_content(event, str(text), fixed)
 
     async def outlet(self, body: dict, __event_emitter__=None) -> Optional[dict]:
         # Emit a completion status in case the stream ended without a sentinel.
