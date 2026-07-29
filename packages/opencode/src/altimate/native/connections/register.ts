@@ -43,6 +43,54 @@ import { Telemetry } from "../../../telemetry"
 /** Cached dbt adapter (lazily created on first use). */
 let dbtAdapter: any | null | undefined = undefined
 
+// altimate_change start — swallow python-bridge IPC teardown rejections
+// The dbt adapter runs a Python subprocess via `python-bridge`, which is built
+// on bluebird. When that subprocess exits (e.g. the project's python has no
+// `dbt` module, or on normal teardown), any queued `.send()` rejects with
+// ERR_IPC_CHANNEL_CLOSED. bluebird surfaces these OUT OF BAND — they escape the
+// await/try-catch around adapter calls and reach the serve process as unhandled
+// rejections, spamming the terminal (and, unhandled, could take the process
+// down). This is a benign teardown artifact, not a query failure: the caller
+// already falls back to the native driver. Install a single process-level guard
+// that swallows only python-bridge IPC-closed rejections and re-raises the rest.
+let ipcGuardInstalled = false
+let loggedIpcClose = false
+
+function isIpcChannelClosed(err: unknown): boolean {
+  const anyErr = err as { code?: string; message?: string } | undefined
+  if (!anyErr) return false
+  if (anyErr.code === "ERR_IPC_CHANNEL_CLOSED") return true
+  const msg = anyErr.message ?? String(err)
+  return (
+    msg.includes("ERR_IPC_CHANNEL_CLOSED") ||
+    msg.includes("IPC channel is open") ||
+    msg.includes("after the process has exited")
+  )
+}
+
+function installIpcRejectionGuard() {
+  if (ipcGuardInstalled) return
+  ipcGuardInstalled = true
+  process.on("unhandledRejection", (reason) => {
+    if (isIpcChannelClosed(reason)) {
+      // Log once so the condition is discoverable, then stay silent: these fire
+      // repeatedly as queued bridge messages drain against a dead channel.
+      if (!loggedIpcClose) {
+        loggedIpcClose = true
+        // The dbt Python bridge exited (commonly: the project's python has no
+        // `dbt` installed). SQL falls back to the native driver.
+        console.error(
+          "[altimate] dbt Python bridge unavailable (ERR_IPC_CHANNEL_CLOSED); using native driver. Run `altimate-dbt doctor` if you expect dbt-routed queries.",
+        )
+      }
+      return
+    }
+    // Not ours — preserve default crash-on-unhandled-rejection behavior.
+    throw reason
+  })
+}
+// altimate_change end
+
 /**
  * Try to execute SQL via dbt's adapter (which uses profiles.yml for connection).
  * Returns null if dbt is not available or not configured — caller should fall back
@@ -80,7 +128,12 @@ async function tryExecuteViaDbt(
         return null
       }
 
-      // Create the adapter
+      // Create the adapter. The adapter starts a Python bridge whose failures
+      // can surface as out-of-band bluebird rejections, so guard the process
+      // before we ever touch it.
+      // altimate_change start — install IPC rejection guard before adapter use
+      installIpcRejectionGuard()
+      // altimate_change end
       const { create } = await import("../../../../../dbt-tools/src/adapter")
       dbtAdapter = await create(dbtConfig)
     } catch {
@@ -137,7 +190,20 @@ async function tryExecuteViaDbt(
     }
 
     return null // Unknown result format — fall back to native
-  } catch {
+  } catch (e) {
+    // altimate_change start — permanently disable a dead dbt bridge
+    // If the Python bridge is gone (IPC channel closed / process exited), every
+    // future call will respawn a doomed subprocess and re-emit the same
+    // out-of-band rejection. Disable the dbt path for the rest of the session
+    // so we go straight to the native driver. Other failures (bad SQL, timeout)
+    // are per-query — keep the adapter for the next call.
+    if (isIpcChannelClosed(e)) {
+      try {
+        await dbtAdapter?.dispose?.()
+      } catch {}
+      dbtAdapter = null
+    }
+    // altimate_change end
     // dbt execution failed — fall back to native driver silently
     return null
   }

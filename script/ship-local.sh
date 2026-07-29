@@ -5,6 +5,8 @@
 #   ./script/ship-local.sh
 #   ./script/ship-local.sh --skip-build   # reinstall existing dist binary only
 #
+# MODELS_DEV_API_JSON=/path/to/api.json   build against a local models.dev copy
+#                                         instead of fetching it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +18,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-build) SKIP_BUILD=true; shift ;;
     -h|--help)
-      sed -n '2,8p' "$0"
+      sed -n '2,9p' "$0"
       exit 0
       ;;
     *)
@@ -42,6 +44,52 @@ case "$ARCH" in
 esac
 
 BINARY="$PKG_DIR/dist/@altimateai/altimate-code-${OS}-${ARCH}/bin/altimate"
+SNAPSHOT="$PKG_DIR/src/provider/models-snapshot.ts"
+MODELS_URL="${OPENCODE_MODELS_URL:-https://models.dev}/api.json"
+TMP_MODELS=""
+
+cleanup() {
+  if [ -n "$TMP_MODELS" ]; then
+    rm -f "$TMP_MODELS"
+  fi
+}
+trap cleanup EXIT
+
+looks_like_json() {
+  [ -s "$1" ] && [ "$(head -c 1 "$1")" = "{" ]
+}
+
+# build.ts fetches models.dev with bun's fetch, which validates TLS against bun's
+# own CA bundle rather than the system trust store — so behind a TLS-inspecting
+# proxy it dies with UNABLE_TO_GET_ISSUER_CERT_LOCALLY. curl does trust the
+# system store, so fetch the file here and hand it to the build via
+# MODELS_DEV_API_JSON. With no network at all, reuse the snapshot in the tree.
+resolve_models_json() {
+  if [ -n "${MODELS_DEV_API_JSON:-}" ]; then
+    echo "Using MODELS_DEV_API_JSON=$MODELS_DEV_API_JSON"
+    return 0
+  fi
+
+  TMP_MODELS="$(mktemp "${TMPDIR:-/tmp}/models-dev-api.XXXXXX")"
+
+  if curl -fsS --max-time 60 -o "$TMP_MODELS" "$MODELS_URL" && looks_like_json "$TMP_MODELS"; then
+    export MODELS_DEV_API_JSON="$TMP_MODELS"
+    echo "Fetched $MODELS_URL"
+    return 0
+  fi
+
+  if [ -f "$SNAPSHOT" ] &&
+    sed -n 's/^export const snapshot = \(.*\) as const$/\1/p' "$SNAPSHOT" >"$TMP_MODELS" &&
+    looks_like_json "$TMP_MODELS"; then
+    export MODELS_DEV_API_JSON="$TMP_MODELS"
+    echo "warning: $MODELS_URL unreachable; reusing $SNAPSHOT (model list may be stale)" >&2
+    return 0
+  fi
+
+  echo "error: could not fetch $MODELS_URL and no usable snapshot at $SNAPSHOT" >&2
+  echo "  set MODELS_DEV_API_JSON=/path/to/api.json to build from a local copy" >&2
+  return 1
+}
 
 codesign_macos() {
   local path=$1
@@ -58,6 +106,7 @@ codesign_macos() {
 }
 
 if [ "$SKIP_BUILD" = false ]; then
+  resolve_models_json
   echo "Building single-platform binary…"
   (
     cd "$PKG_DIR"

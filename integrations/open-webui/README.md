@@ -53,11 +53,11 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 
 | Bridge chunk | Filter behavior |
 | --- | --- |
-| tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. |
-| tool response (`{"name","duration"}`) | Dropped (kept out of the message body). |
+| tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. For SQL tools the preview is the agent's `reason`. |
+| tool response (`{"name","duration","status","error"}`) | Dropped from the message body. |
 | reasoning (`delta.reasoning_content`) | Forwarded for Open WebUI’s native Thought collapsible. |
 | plain text | Forwarded; if a chunk starts with a markdown block marker (`#`, `-`, `*`, …) and the previous chunk ended with a full stop (`.`), a newline is prefixed. |
-| completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. |
+| completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. Final SQL is streamed by the bridge as ordinary text just before this sentinel. |
 | error | Emits a "❌ Error occurred." pill. |
 
 Detection is content-based (it parses the `{"name", ...}` payload), so it does not
@@ -66,17 +66,50 @@ depend on Open WebUI forwarding the custom `message_type` field.
 Tool labels and argument previews live in `TOOL_LABELS` / `ARG_PREVIEW` at the top
 of `filter.py` — edit those to taste.
 
-### Surfacing SQL (and other tool args) into the chat
+### SQL rationale and the final SQL
 
-`REVEAL_TOOLS` maps a tool name to a function that renders its arguments into the
-message body. By default `sql_execute` renders the executed statement as a
-```sql``` code block above the answer, so the underlying SQL shows alongside the
-response. Add more entries to reveal other tools.
+`sql_execute` takes an optional `reason` — one sentence from the agent explaining
+why that query is being run. The builder and analyst prompts instruct the agent
+to always pass it. The filter uses it in two places:
+
+- **Per step** — the status pill reads `🧮 Executing SQL | Find the latest month
+  with complete F&O data` instead of a truncated statement, so the step list
+  reads as the agent's plan rather than a wall of SQL.
+- **End of turn** — the bridge streams a `Final SQL` section as ordinary
+  assistant text just before the completion sentinel. That puts it in the same
+  stream Open WebUI uses to build the saved message body (filter-side message
+  events get wiped when the body is rebuilt). The section shows the last query
+  that succeeded, the warehouse it ran against, its rationale, and a one-line
+  recap of the earlier queries (failed ones marked).
+
+Queries that failed are excluded from `Final SQL`; if every query failed, the last
+attempt is shown and the heading says so. Failure detection uses the tool's
+result metadata on the bridge. A missing `reason` degrades to a statement
+preview in the pill and no `Why:` line.
+
+### Turn state and the completion pill
+
+Open WebUI builds one `Filter` instance per function and reuses it for every
+request, while `inlet`, `stream` and `outlet` arrive as three independent HTTP
+requests — `outlet` is a separate `/api/chat/completed` call fired by the browser
+after streaming ends. Those can interleave: turn N's `outlet` may land after turn
+N+1 has already started, and two chats, two tabs, or a side-by-side model
+comparison run through the same instance concurrently.
+
+The filter therefore keys all per-turn state (timer, completion flag, collected
+SQL) by `__metadata__["message_id"]` rather than storing it on `self`. When
+metadata isn't forwarded it falls back to the chunk `id`, and the role-only
+opening delta of each turn starts a fresh record under that key.
+
+This is what caused the completion pill to intermittently go missing, or to show
+a nonsensical duration such as "Complete in 0s": a stale `outlet` consumed the
+shared "already completed" flag, so the next turn's real completion was
+suppressed, and the shared start timestamp had been reset by the newer turn.
 
 ### Execution time
 
 The "Complete in Xs" pill uses `overall_duration` from the bridge's final chunk
-when present, and otherwise falls back to the time the filter measured for the
+when present, and otherwise falls back to the time the filter measured for that
 turn — so it stays correct even if the running `altimate` binary predates the
 `overall_duration` bridge change. Rebuild the binary to get the exact
 server-measured duration.

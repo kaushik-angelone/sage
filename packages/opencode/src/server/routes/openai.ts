@@ -128,12 +128,142 @@ function chunk(input: {
   }
 }
 
+// altimate_change start — end-of-turn SQL recap
+interface SqlStep {
+  query: string
+  warehouse?: string
+  reason?: string
+  failed: boolean
+}
+
+const SQL_TOOLS = new Set(["sql_execute"])
+
+function oneLine(value: string, limit = 70) {
+  const text = value.split(/\s+/).filter(Boolean).join(" ")
+  return text.length > limit ? text.slice(0, limit).trimEnd() + "..." : text
+}
+
+function sqlStepFromInput(input: unknown): SqlStep | undefined {
+  if (!input || typeof input !== "object") return undefined
+  const args = input as Record<string, unknown>
+  const query = typeof args["query"] === "string" ? args["query"].trim() : ""
+  if (!query) return undefined
+  const warehouse = typeof args["warehouse"] === "string" ? args["warehouse"].trim() : undefined
+  const reason = typeof args["reason"] === "string" ? args["reason"].trim() : undefined
+  return { query, warehouse: warehouse || undefined, reason: reason || undefined, failed: false }
+}
+
+// Tool-call chunks go through the OWUI filter as JSON in delta.content. Shipping
+// the full SQL there is unnecessary (Final SQL is streamed at end-of-turn) and
+// can break the filter when a large statement is truncated mid-SSE — the pill
+// then silently disappears. Keep the status payload small and self-describing.
+function argsForOwui(tool: string, input: unknown): Record<string, unknown> {
+  const args =
+    input && typeof input === "object" ? { ...(input as Record<string, unknown>) } : ({} as Record<string, unknown>)
+  if (tool !== "sql_execute") return args
+
+  const reason = typeof args["reason"] === "string" ? args["reason"].trim() : ""
+  const query = typeof args["query"] === "string" ? args["query"] : typeof args["sql"] === "string" ? args["sql"] : ""
+  const warehouse = typeof args["warehouse"] === "string" ? args["warehouse"].trim() : ""
+  const preview = reason || oneLine(query, 90)
+  return {
+    ...(reason ? { reason } : {}),
+    ...(warehouse ? { warehouse } : {}),
+    ...(query ? { query: oneLine(query, 120) } : {}),
+    status_description: preview ? `🧮 Executing SQL | ${preview}` : "🧮 Executing SQL",
+  }
+}
+
+// Distinguish the query that produced the answer from trailing exploration.
+//
+// "Last successful execution" is a bad proxy for "the query behind the table":
+// agents routinely run a cheap probe AFTER the real aggregation (e.g.
+// `SELECT DISTINCT category, type` to sanity-check labels), and that probe would
+// otherwise be surfaced as the Final SQL. We instead score each successful step
+// by how much it looks like a result-producing query and pick the best one,
+// breaking ties toward the later query. Falls back to last-executed when nothing
+// scores (e.g. every query is a plain SELECT), preserving the old behavior.
+function looksExploratory(query: string): boolean {
+  const q = query.trim().toLowerCase()
+  // Schema/metadata probes are never the answer query.
+  if (/^\s*(show|describe|desc|explain|use)\b/.test(q)) return true
+  // `SELECT DISTINCT <cols>` with no aggregation is a label/enumeration probe.
+  if (/^\s*select\s+distinct\b/.test(q) && !/\bgroup\s+by\b/.test(q)) return true
+  return false
+}
+
+function resultQueryScore(step: SqlStep): number {
+  const q = step.query.toLowerCase()
+  let score = 0
+  if (/\bgroup\s+by\b/.test(q)) score += 3
+  if (/\b(sum|count|avg|min|max|median|percentile|approx_count_distinct)\s*\(/.test(q)) score += 2
+  if (/\bwith\b[\s\S]*\bas\s*\(/.test(q)) score += 1 // CTE — usually the composed answer
+  if (/\border\s+by\b/.test(q)) score += 1
+  if (/\bjoin\b/.test(q)) score += 1
+  if (looksExploratory(step.query)) score -= 5
+  // Longer statements tend to be the composed answer, not a probe. Kept small so
+  // it only breaks ties between otherwise-similar queries.
+  score += Math.min(2, Math.floor(step.query.length / 200))
+  return score
+}
+
+function pickFinalStep(steps: SqlStep[]): SqlStep {
+  const ok = steps.filter((step) => !step.failed)
+  const candidates = ok.length > 0 ? ok : steps
+  // Highest score wins; on a tie, the later query wins (reduceRight-style: iterate
+  // forward and use `>` so the last max is kept).
+  let best = candidates[0]
+  let bestScore = resultQueryScore(best)
+  for (let i = 1; i < candidates.length; i++) {
+    const s = resultQueryScore(candidates[i])
+    if (s >= bestScore) {
+      best = candidates[i]
+      bestScore = s
+    }
+  }
+  return best
+}
+
+// The recap is streamed as ordinary assistant text rather than pushed by the
+// Open WebUI filter: clients persist the message from the accumulated stream
+// deltas, so anything injected out-of-band is dropped when the turn is saved.
+function renderSqlRecap(steps: SqlStep[]) {
+  if (steps.length === 0) return ""
+  const final = pickFinalStep(steps)
+  const earlier = steps.filter((step) => step !== final)
+
+  let title = "Final SQL"
+  if (final.failed) title += " — failed"
+
+  let out = `\n\n---\n\n**${title}**\n\n\`\`\`sql\n${final.query}\n\`\`\`\n`
+  if (final.reason) out += `\n**Why:** ${final.reason}\n`
+  if (earlier.length > 0) {
+    out += `\n**Earlier queries (${earlier.length})**\n\n`
+    earlier.forEach((step, index) => {
+      const reason = (step.reason || "no reason recorded") + (step.failed ? " (failed)" : "")
+      out += `${index + 1}. ${reason} — \`${oneLine(step.query)}\`\n`
+    })
+  }
+  return out
+}
+// altimate_change end
+
 // Subscribe to the session event stream and translate it into OWUI-shaped
 // events via `emit`. Returns a promise that resolves when the turn goes idle
 // (or errors), plus an `unsubscribe` handle for client disconnects.
 function consumeSession(input: {
   sessionID: SessionID
-  emit: (kind: EmitKind, payload: { content?: string; name?: string; args?: unknown; duration?: number }) => void
+  emit: (
+    kind: EmitKind,
+    payload: {
+      content?: string
+      name?: string
+      args?: unknown
+      duration?: number
+      status?: "completed" | "error"
+      error?: string
+    },
+  ) => void
   onError: (message: string) => void
 }) {
   const { sessionID, emit, onError } = input
@@ -143,6 +273,9 @@ function consumeSession(input: {
   const finalizedTextParts = new Set<string>()
   const emittedToolCall = new Set<string>()
   const emittedToolDone = new Set<string>()
+  // Executed SQL, in execution order, for the end-of-turn recap.
+  const sqlSteps: SqlStep[] = []
+  const sqlStepByCall = new Map<string, SqlStep>()
   // Deltas can race ahead of the part.updated that classifies a part as
   // text vs reasoning. Buffer until we know which emit kind to use.
   const pendingDeltas = new Map<string, string[]>()
@@ -219,22 +352,52 @@ function consumeSession(input: {
 
       if (part.type === "tool") {
         const state = part.state ?? {}
+        const trackSql = () => {
+          if (!SQL_TOOLS.has(part.tool)) return
+          const step = sqlStepFromInput(state.input)
+          if (!step) return
+          const existing = sqlStepByCall.get(part.callID)
+          if (existing) {
+            // The running state can carry a partially streamed input; the
+            // completed state is authoritative.
+            Object.assign(existing, step, { failed: existing.failed })
+            return
+          }
+          sqlStepByCall.set(part.callID, step)
+          sqlSteps.push(step)
+        }
         if (state.status === "running" && !emittedToolCall.has(part.callID)) {
           emittedToolCall.add(part.callID)
-          emit("tool_call", { name: part.tool, args: state.input ?? {} })
+          trackSql()
+          emit("tool_call", { name: part.tool, args: argsForOwui(part.tool, state.input) })
           return
         }
         if ((state.status === "completed" || state.status === "error") && !emittedToolDone.has(part.callID)) {
           // Make sure a call chunk was emitted even if we missed the running state.
           if (!emittedToolCall.has(part.callID)) {
             emittedToolCall.add(part.callID)
-            emit("tool_call", { name: part.tool, args: state.input ?? {} })
+            emit("tool_call", { name: part.tool, args: argsForOwui(part.tool, state.input) })
           }
           emittedToolDone.add(part.callID)
+          trackSql()
           const start = state.time?.start
           const end = state.time?.end
           const duration = typeof start === "number" && typeof end === "number" ? (end - start) / 1000 : undefined
-          emit("tool_done", { name: part.tool, duration })
+          // Tools like sql_execute report failures in their metadata rather than
+          // by throwing, so a "completed" state can still be a failed call.
+          const metadataError = state.metadata?.error
+          const error =
+            typeof state.error === "string" ? state.error : typeof metadataError === "string" ? metadataError : undefined
+          if (error) {
+            const step = sqlStepByCall.get(part.callID)
+            if (step) step.failed = true
+          }
+          emit("tool_done", {
+            name: part.tool,
+            duration,
+            status: state.status === "error" || error ? "error" : "completed",
+            error,
+          })
           return
         }
       }
@@ -273,7 +436,7 @@ function consumeSession(input: {
   // finish() force-resolves the turn. Used when the (blocking) prompt promise
   // settles, so a prompt that never reaches an "idle" status (e.g. it throws
   // before the run starts) cannot hang the SSE stream open forever.
-  return { done, unsubscribe, finish: () => resolveDone() }
+  return { done, unsubscribe, finish: () => resolveDone(), sqlSteps }
 }
 
 export const OpenAIRoutes = lazy(() =>
@@ -327,7 +490,9 @@ export const OpenAIRoutes = lazy(() =>
       }
 
       const sessionID = await resolveSession(chatKey, userMessage)
-      const completionID = `chatcmpl-${sessionID}`
+      // Unique per turn, like the OpenAI API: a session serves many turns, and
+      // clients key per-turn state off this id.
+      const completionID = `chatcmpl-${sessionID}-${Date.now().toString(36)}`
 
       const firePrompt = () =>
         SessionPrompt.prompt({
@@ -346,7 +511,7 @@ export const OpenAIRoutes = lazy(() =>
         // Non-streaming: buffer assistant text and return a single completion.
         let text = ""
         let errored: string | undefined
-        const { done, unsubscribe, finish } = consumeSession({
+        const { done, unsubscribe, finish, sqlSteps } = consumeSession({
           sessionID,
           emit: (kind, payload) => {
             if (kind === "text" && payload.content) text += payload.content
@@ -369,7 +534,10 @@ export const OpenAIRoutes = lazy(() =>
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: errored ? `${text}\n\n**Error:** ${errored}` : text },
+              message: {
+                role: "assistant",
+                content: (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps),
+              },
               finish_reason: "stop",
             },
           ],
@@ -394,7 +562,7 @@ export const OpenAIRoutes = lazy(() =>
           }),
         )
 
-        const { done, unsubscribe, finish } = consumeSession({
+        const { done, unsubscribe, finish, sqlSteps } = consumeSession({
           sessionID,
           emit: (kind, payload) => {
             if (kind === "text" && payload.content) {
@@ -440,7 +608,14 @@ export const OpenAIRoutes = lazy(() =>
                   model,
                   author: "tool done",
                   messageType: "tool response",
-                  delta: { content: JSON.stringify({ name: payload.name, duration: payload.duration }) },
+                  delta: {
+                    content: JSON.stringify({
+                      name: payload.name,
+                      duration: payload.duration,
+                      status: payload.status,
+                      error: payload.error,
+                    }),
+                  },
                 }),
               )
               return
@@ -469,6 +644,23 @@ export const OpenAIRoutes = lazy(() =>
           await done
         } finally {
           unsubscribe()
+        }
+
+        // Stream the Final SQL recap as ordinary assistant text BEFORE the
+        // completion sentinel. Open WebUI rebuilds the saved message from
+        // accumulated stream deltas / output items, so anything pushed only via
+        // the filter's event emitter is wiped when the turn finishes.
+        const recap = renderSqlRecap(sqlSteps)
+        if (recap) {
+          await write(
+            chunk({
+              id: completionID,
+              model,
+              author: "assistant",
+              messageType: "text",
+              delta: { content: recap },
+            }),
+          )
         }
 
         // Final finish chunk + OpenAI stream terminator. Carries the total turn

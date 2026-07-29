@@ -20,6 +20,14 @@ export const SqlExecuteTool = Tool.define("sql_execute", {
     query: z.string().describe("SQL query to execute"),
     warehouse: z.string().optional().describe("Warehouse connection name"),
     limit: z.number().optional().default(100).describe("Max rows to return"),
+    // altimate_change start — rationale surfaced next to every executed query
+    reason: z
+      .string()
+      .optional()
+      .describe(
+        "One short sentence stating why this query is being run, e.g. 'Find the latest month with complete F&O data'. Shown to the user next to the query, so write it for them rather than for yourself.",
+      ),
+    // altimate_change end
   }),
   async execute(args, ctx) {
     // altimate_change start - SQL write access control
@@ -89,14 +97,14 @@ export const SqlExecuteTool = Tool.define("sql_execute", {
       // altimate_change end
       return {
         title: `SQL: ${args.query.slice(0, 60)}${args.query.length > 60 ? "..." : ""}`,
-        metadata: { rowCount: result.row_count, truncated: result.truncated },
+        metadata: { rowCount: result.row_count, truncated: result.truncated, reason: args.reason },
         output,
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       return {
         title: "SQL: ERROR",
-        metadata: { rowCount: 0, truncated: false, error: msg },
+        metadata: { rowCount: 0, truncated: false, error: msg, reason: args.reason },
         output: `Failed to execute SQL: ${msg}\n\nEnsure the dispatcher is running and a warehouse connection is configured.`,
       }
     }

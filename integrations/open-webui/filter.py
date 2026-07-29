@@ -7,6 +7,8 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
   * `message_type: "tool call"`   -> a compact status pill (spinner) with a
                                       friendly label + argument preview, and the
                                       raw JSON chunk is dropped from the message.
+                                      For SQL tools the preview is the agent's
+                                      `reason` — why that query is being run.
   * `message_type: "tool response"` -> dropped (kept out of the message body).
   * `message_type: "text"`        -> forwarded to the message body; if a chunk
                                       starts with a markdown block marker (#, -,
@@ -16,15 +18,23 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
   * reasoning deltas              -> forwarded as `delta.reasoning_content` for
                                       Open WebUI's native Thought collapsible.
   * completion sentinel           -> a "Complete in Xs" done status pill.
+                                      Final SQL is streamed by the bridge as
+                                      ordinary text before this sentinel.
   * `message_type: "error"`       -> an error status pill.
 
 The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):
   - tool call:     delta.content = JSON {"name": <tool>, "args": {...}}
-  - tool response: delta.content = JSON {"name": <tool>, "duration": <seconds>}
+  - tool response: delta.content = JSON {"name": <tool>, "duration": <seconds>,
+                                         "status": "completed" | "error",
+                                         "error": <message>}
+                   `status` / `error` are absent on older binaries.
   - reasoning:     delta.reasoning_content = <thought text>
   - final chunk:   choices[0].finish_reason = "stop",
                    choices[0].stream_complete = true,
                    choices[0].overall_duration = <seconds>
+
+Per-turn state is keyed by `__metadata__["message_id"]` because Open WebUI shares
+one Filter instance across every request — see MAX_TRACKED_TURNS below.
 
 This mirrors the Data-Agent-ADK OWUI filter, adapted to sage's tool set.
 """
@@ -32,6 +42,7 @@ This mirrors the Data-Agent-ADK OWUI filter, adapted to sage's tool set.
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Optional
 
 logger = logging.getLogger("altimate_owui_filter")
@@ -40,6 +51,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Friendly, human-readable labels per sage tool name.
 TOOL_LABELS = {
+    "sql_execute": "🧮 Executing SQL",
     "bash": "⚙️ Running command",
     "shell": "⚙️ Running shell",
     "edit": "✏️ Editing file",
@@ -72,8 +84,19 @@ def _basename(value: object) -> str:
     return text.rstrip("/").split("/")[-1]
 
 
+def _one_line(value: object, limit: int = 70) -> str:
+    """Collapse a multi-line statement into a short single-line preview."""
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
+
+
 # Which arg to preview after the label, keyed by tool name.
 ARG_PREVIEW = {
+    # `reason` is the agent's own explanation of why this query is being run;
+    # fall back to the statement itself when the binary predates that arg.
+    "sql_execute": lambda a: a.get("reason") or _one_line(a.get("query") or a.get("sql")),
     "bash": lambda a: a.get("description") or a.get("command"),
     "shell": lambda a: a.get("description") or a.get("command"),
     "edit": lambda a: _basename(a.get("filePath")),
@@ -91,26 +114,10 @@ ARG_PREVIEW = {
     "question": lambda a: a.get("question"),
 }
 
-def _sql_reveal(args: dict) -> Optional[str]:
-    """Render an executed SQL statement into the chat body as a code block."""
-    query = str(args.get("query") or args.get("sql") or "").strip()
-    if not query:
-        return None
-    warehouse = str(args.get("warehouse") or "").strip()
-    title = f"SQL · {warehouse}" if warehouse else "SQL"
-    return f"\n\n**{title}**\n\n```sql\n{query}\n```\n"
-
-
-# Tools whose arguments should be surfaced into the message body (not just a
-# status pill). Maps tool name -> function(args) -> markdown (or None to skip).
-REVEAL_TOOLS = {
-    "sql_execute": _sql_reveal,
-}
-
-
 # Fallback preview keys for unknown / project-specific tools (checked in order).
 GENERIC_PREVIEW_KEYS = (
     "status_description",
+    "reason",
     "description",
     "title",
     "query",
@@ -126,6 +133,20 @@ GENERIC_PREVIEW_KEYS = (
 # Block-level markdown starters that look broken when glued onto the previous
 # streamed token (e.g. "done.# Heading" → "done.\n# Heading").
 _MD_LINE_STARTERS = ("#", "-", "*", "+", ">", "|", "`", "=", "~")
+
+# Status pill previews are truncated to keep the pill on one line. SQL steps get
+# more room because their preview is a full sentence of rationale.
+PREVIEW_LIMIT_DEFAULT = 50
+PREVIEW_LIMITS = {"sql_execute": 90}
+
+# Open WebUI builds ONE Filter instance per function and reuses it for every
+# request (utils/plugin.py: get_function_module_from_cache), while inlet, stream
+# and outlet arrive as separate HTTP requests that interleave freely across
+# turns, chats and users. Anything kept on `self` is therefore shared: a late
+# outlet from the previous turn, a second chat, or a side-by-side model
+# comparison would clobber the live turn's timer and completion flag. Turn state
+# is keyed by the message id instead, and only a bounded number is retained.
+MAX_TRACKED_TURNS = 32
 
 
 def _fmt_duration(duration: object) -> str:
@@ -143,13 +164,43 @@ def _fmt_duration(duration: object) -> str:
 
 class Filter:
     def __init__(self):
-        self._reset_stream_state()
+        self._turns = OrderedDict()
 
-    def _reset_stream_state(self) -> None:
-        self._complete_emitted = False
-        self._started_at = None
-        self._revealed = set()
-        self._prev_ends_with_full_stop = False
+    @staticmethod
+    def _turn_key(metadata: Optional[dict], event: Optional[dict] = None) -> str:
+        """Identify the turn a hook call belongs to.
+
+        `message_id` is unique per assistant message, which is exactly one turn.
+        The chunk `id` is the fallback for deployments that do not forward
+        metadata to filters; it is stable per chat rather than per turn, so the
+        role-only opening delta is what starts a fresh turn under that key.
+        """
+        if isinstance(metadata, dict):
+            for key in ("message_id", "chat_id", "session_id"):
+                value = metadata.get(key)
+                if value:
+                    return str(value)
+        if isinstance(event, dict) and event.get("id"):
+            return str(event["id"])
+        return "_default"
+
+    def _new_turn(self) -> dict:
+        return {
+            "started_at": time.monotonic(),
+            "complete_emitted": False,
+            "prev_ends_with_full_stop": False,
+        }
+
+    def _turn(self, key: str) -> dict:
+        turn = self._turns.get(key)
+        if turn is None:
+            turn = self._new_turn()
+            self._turns[key] = turn
+            while len(self._turns) > MAX_TRACKED_TURNS:
+                self._turns.popitem(last=False)
+        else:
+            self._turns.move_to_end(key)
+        return turn
 
     @staticmethod
     def _starts_markdown_line(text: str) -> bool:
@@ -157,15 +208,15 @@ class Filter:
             return False
         return text[0] in _MD_LINE_STARTERS
 
-    def _ensure_markdown_newline(self, text: str) -> str:
+    def _ensure_markdown_newline(self, turn: dict, text: str) -> str:
         """Prefix a newline when markdown follows a sentence-ending full stop."""
         if not isinstance(text, str) or not text:
             return text
         out = text
-        if self._starts_markdown_line(text) and self._prev_ends_with_full_stop:
+        if self._starts_markdown_line(text) and turn["prev_ends_with_full_stop"]:
             out = "\n" + text
         # Ignore trailing whitespace/newlines when detecting a sentence end.
-        self._prev_ends_with_full_stop = text.rstrip().endswith(".")
+        turn["prev_ends_with_full_stop"] = text.rstrip().endswith(".")
         return out
 
     def _rewrite_delta_content(self, event: dict, original: str, updated: str) -> dict:
@@ -185,19 +236,15 @@ class Filter:
                 break
         return event
 
-    def _mark_started(self) -> None:
-        # First activity of the turn — used to compute elapsed time as a fallback
-        # when the bridge does not provide overall_duration.
-        if self._started_at is None:
-            self._started_at = time.monotonic()
-
-    def _resolve_duration(self, provided: object) -> float:
+    def _resolve_duration(self, turn: dict, provided: object) -> float:
         try:
             d = float(provided) if provided is not None else 0.0
         except (TypeError, ValueError):
             d = 0.0
-        if d <= 0 and self._started_at is not None:
-            d = max(0.0, time.monotonic() - self._started_at)
+        # Fallback for binaries that predate the overall_duration bridge change:
+        # time this turn ourselves, from its own first chunk.
+        if d <= 0:
+            d = max(0.0, time.monotonic() - turn["started_at"])
         return d
 
     async def _emit_status(self, description: str, done: bool, __event_emitter__) -> None:
@@ -210,35 +257,14 @@ class Filter:
             }
         )
 
-    async def _emit_message(self, content: str, __event_emitter__) -> None:
-        if __event_emitter__ is None or not content:
+    async def _emit_complete(self, turn: dict, duration: object, __event_emitter__) -> None:
+        if turn["complete_emitted"] or __event_emitter__ is None:
             return
-        await __event_emitter__({"type": "message", "data": {"content": content}})
-
-    async def _maybe_reveal(self, tool_name: str, args: dict, __event_emitter__) -> None:
-        reveal_fn = REVEAL_TOOLS.get(tool_name)
-        if reveal_fn is None or __event_emitter__ is None or not isinstance(args, dict):
-            return
-        try:
-            markdown = reveal_fn(args)
-        except Exception:  # noqa: BLE001 - never let a reveal break the stream
-            markdown = None
-        if not markdown:
-            return
-        key = (tool_name, hash(markdown))
-        if key in self._revealed:
-            return
-        self._revealed.add(key)
-        await self._emit_message(markdown, __event_emitter__)
-
-    async def _emit_complete(self, duration: object, __event_emitter__) -> None:
-        if self._complete_emitted or __event_emitter__ is None:
-            return
-        resolved = self._resolve_duration(duration)
+        resolved = self._resolve_duration(turn, duration)
         await self._emit_status(
             f"✅ Complete in {_fmt_duration(resolved)}. ", True, __event_emitter__
         )
-        self._complete_emitted = True
+        turn["complete_emitted"] = True
 
     def _status_for_tool(self, tool_name: str, args: dict) -> str:
         # Backend-provided status_description always wins.
@@ -264,18 +290,17 @@ class Filter:
             except Exception:  # noqa: BLE001 - never let preview break the stream
                 preview = None
         if preview is not None and str(preview).strip():
-            preview = str(preview).strip().replace("\n", " ")
-            if len(preview) > 50:
-                preview = preview[:50] + "..."
-            label += f" | {preview}"
+            limit = PREVIEW_LIMITS.get(tool_name, PREVIEW_LIMIT_DEFAULT)
+            label += f" | {_one_line(preview, limit)}"
         return label
 
     def _parse_tool_payload(self, text: str):
         """Return (kind, name, args) for a tool chunk, else None.
 
-        kind is "call" (has args) or "response" (has duration). Detection is
-        content-based so it works even when Open WebUI drops the custom
-        top-level ``message_type`` field.
+        kind is "call" (has args) or "response" (has duration / status). For a
+        response the whole payload is returned so the outcome is available.
+        Detection is content-based so it works even when Open WebUI drops the
+        custom top-level ``message_type`` field.
         """
         if not text or not str(text).lstrip().startswith("{"):
             return None
@@ -287,13 +312,21 @@ class Filter:
             return None
         if "args" in parsed:
             return ("call", parsed["name"], parsed.get("args") or {})
-        if "duration" in parsed:
-            return ("response", parsed["name"], {})
+        if "duration" in parsed or "status" in parsed:
+            return ("response", parsed["name"], parsed)
         return None
 
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._reset_stream_state()
-        self._mark_started()
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+    ) -> dict:
+        # Start this turn's state fresh; a retried or regenerated message reuses
+        # its message id, so drop any earlier record under the same key.
+        key = self._turn_key(__metadata__)
+        self._turns.pop(key, None)
+        self._turn(key)
         return body
 
     @staticmethod
@@ -304,20 +337,41 @@ class Filter:
                 return value
         return None
 
-    async def stream(self, event: dict, __event_emitter__=None) -> Optional[dict]:
-        self._mark_started()
-        choices = event.get("choices", []) or []
+    async def stream(
+        self,
+        event: dict,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+    ) -> Optional[dict]:
+        if not isinstance(event, dict):
+            return event
+        key = self._turn_key(__metadata__, event)
+        turn = self._turn(key)
+        choices = [c for c in (event.get("choices") or []) if isinstance(c, dict)]
 
         # Collect any text content in this chunk.
         contents = []
         has_reasoning = False
+        opens_turn = False
         for choice in choices:
             delta = choice.get("delta", {}) or {}
+            if not isinstance(delta, dict):
+                continue
             if "content" in delta and delta.get("content") is not None:
                 contents.append(delta["content"])
             if self._reasoning_delta(delta):
                 has_reasoning = True
+            if delta.get("role") and "content" not in delta:
+                opens_turn = True
         text = contents[0] if contents else ""
+
+        # The bridge opens every turn with a role-only delta. Under the chunk-id
+        # fallback key (stable per chat, not per turn) this marker is what keeps
+        # one turn's completion flag from suppressing the next turn's pill.
+        if opens_turn:
+            turn = self._new_turn()
+            self._turns[key] = turn
+            return None
 
         message_type = event.get("message_type")
 
@@ -334,7 +388,7 @@ class Filter:
         )
         if is_complete_sentinel:
             await self._emit_complete(
-                first_choice.get("overall_duration", 0), __event_emitter__
+                turn, first_choice.get("overall_duration", 0), __event_emitter__
             )
             return None
 
@@ -351,8 +405,6 @@ class Filter:
         if payload is not None:
             kind, tool_name, args = payload
             if kind == "call":
-                # Surface configured tool args (e.g. SQL) into the message body.
-                await self._maybe_reveal(tool_name, args, __event_emitter__)
                 await self._emit_status(
                     self._status_for_tool(tool_name, args), False, __event_emitter__
                 )
@@ -370,16 +422,30 @@ class Filter:
 
         # Keep markdown block markers (# headings, lists, fences, …) on their
         # own line when the model streams them stuck to the previous token.
-        fixed = self._ensure_markdown_newline(str(text))
+        fixed = self._ensure_markdown_newline(turn, str(text))
         return self._rewrite_delta_content(event, str(text), fixed)
 
-    async def outlet(self, body: dict, __event_emitter__=None) -> Optional[dict]:
-        # Emit a completion status in case the stream ended without a sentinel.
+    async def outlet(
+        self,
+        body: dict,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+    ) -> Optional[dict]:
+        # Fallback for a stream that ended without a sentinel (client disconnect,
+        # aborted turn, a bridge that never wrote the final chunk). Scoped to this
+        # turn only: outlet arrives as its own request and can land after the next
+        # turn has already started.
+        key = self._turn_key(__metadata__, body if isinstance(body, dict) else None)
+        turn = self._turns.get(key)
+        if turn is None or turn["complete_emitted"]:
+            return body
+
         duration = None
         if isinstance(body, dict):
             for choice in body.get("choices", []) or []:
                 if isinstance(choice, dict) and "overall_duration" in choice:
                     duration = choice.get("overall_duration")
                     break
-        await self._emit_complete(duration, __event_emitter__)
+        logger.info("no completion sentinel for turn %s; completing from outlet", key)
+        await self._emit_complete(turn, duration, __event_emitter__)
         return body
