@@ -36,6 +36,8 @@ import { WorkspaceContext } from "../../control-plane/workspace-context"
 import { InstanceBootstrap } from "../../project/bootstrap"
 import { Filesystem } from "@/util/filesystem"
 import type { SessionID } from "@/session/schema"
+import type { QuestionID } from "@/question/schema"
+import { Question } from "../../question"
 import {
   deleteMappedSession,
   getMappedSession,
@@ -44,6 +46,26 @@ import {
 import { setOwuiTraceContext } from "./owui-trace-context"
 
 const log = Log.create({ service: "openai-bridge" })
+
+// altimate_change start — pending question registry for OWUI sessions.
+// When the agent calls AskUserQuestion, the OWUI turn ends with the question
+// rendered as text. The user's next message is routed as the answer rather
+// than as a new prompt.
+const pendingOwuiQuestions = new Map<string, QuestionID>()
+
+function formatQuestion(req: Question.Request): string {
+  const parts: string[] = []
+  for (const q of req.questions) {
+    parts.push(`**${q.question}**`)
+    if (q.options.length > 0) {
+      for (const opt of q.options) {
+        parts.push(`- **${opt.label}**: ${opt.description}`)
+      }
+    }
+  }
+  return parts.join("\n")
+}
+// altimate_change end
 
 function modelID() {
   return process.env["ALTIMATE_OWUI_MODEL"] || "altimate-code"
@@ -266,6 +288,7 @@ function renderSqlRecap(steps: SqlStep[]) {
 // (or errors), plus an `unsubscribe` handle for client disconnects.
 function consumeSession(input: {
   sessionID: SessionID
+  sessionKey: string
   emit: (
     kind: EmitKind,
     payload: {
@@ -279,7 +302,7 @@ function consumeSession(input: {
   ) => void
   onError: (message: string) => void
 }) {
-  const { sessionID, emit, onError } = input
+  const { sessionID, sessionKey, emit, onError } = input
   const textParts = new Set<string>()
   const reasoningParts = new Set<string>()
   const deltaStreamedParts = new Set<string>()
@@ -426,6 +449,20 @@ function consumeSession(input: {
       return
     }
 
+    // altimate_change start — surface follow-up questions to Open WebUI.
+    // The agent blocks waiting for a reply; end the current SSE turn with the
+    // question rendered as text so the user sees it, then route their next
+    // message as the answer (handled at the top of /v1/chat/completions).
+    if (event.type === "question.asked") {
+      if (props.sessionID !== sessionID) return
+      const req = props as Question.Request
+      pendingOwuiQuestions.set(sessionKey, req.id)
+      emit("text", { content: formatQuestion(req) })
+      resolveDone()
+      return
+    }
+    // altimate_change end
+
     if (event.type === "session.error") {
       if (props.sessionID && props.sessionID !== sessionID) return
       const err = props.error
@@ -514,6 +551,73 @@ export const OpenAIRoutes = lazy(() =>
       })
       const completionID = `chatcmpl-${sessionID}-${Date.now().toString(36)}`
 
+      // altimate_change start — route user message as question answer when pending.
+      const pendingQuestionID = pendingOwuiQuestions.get(chatKey)
+      if (pendingQuestionID) {
+        pendingOwuiQuestions.delete(chatKey)
+        Question.reply({ requestID: pendingQuestionID, answers: [[userMessage]] }).catch((err) =>
+          log.error("question reply failed", { error: err instanceof Error ? err.message : String(err) }),
+        )
+        // Wait for the agent to finish processing the answer and produce output.
+        const completionIDQ = `chatcmpl-${sessionID}-q-${Date.now().toString(36)}`
+        if (!wantStream) {
+          let text = ""
+          let errored: string | undefined
+          const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+            sessionID,
+            sessionKey: chatKey,
+            emit: (kind, payload) => {
+              if (kind === "text" && payload.content) text += payload.content
+            },
+            onError: (message) => { errored = message },
+          })
+          try {
+            await done
+            finish()
+          } finally {
+            unsubscribe()
+          }
+          return c.json({
+            id: completionIDQ,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, message: { role: "assistant", content: (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps) }, finish_reason: "stop" }],
+          })
+        }
+        c.header("Cache-Control", "no-cache")
+        c.header("Connection", "keep-alive")
+        c.header("X-Accel-Buffering", "no")
+        const startedAtQ = Date.now()
+        return streamSSE(c, async (stream) => {
+          const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
+          await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { role: "assistant" } }))
+          const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+            sessionID,
+            sessionKey: chatKey,
+            emit: (kind, payload) => {
+              if (kind === "text" && payload.content) void write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: payload.content } }))
+              else if (kind === "reasoning" && payload.content) void write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "reasoning", delta: { reasoning_content: payload.content } }))
+              else if (kind === "tool_call") void write(chunk({ id: completionIDQ, model, author: "tool call", messageType: "tool call", delta: { content: JSON.stringify({ name: payload.name, args: payload.args ?? {} }) } }))
+              else if (kind === "tool_done") void write(chunk({ id: completionIDQ, model, author: "tool done", messageType: "tool response", delta: { content: JSON.stringify({ name: payload.name, duration: payload.duration, status: payload.status, error: payload.error }) } }))
+            },
+            onError: (message) => { void write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: `\n\n**Error:** ${message}` } })) },
+          })
+          stream.onAbort(() => { unsubscribe(); SessionPrompt.cancel(sessionID).catch(() => { }) })
+          try {
+            await done
+            finish()
+          } finally {
+            unsubscribe()
+          }
+          const recap = renderSqlRecap(sqlSteps)
+          if (recap) await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: recap } }))
+          await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: {}, finishReason: "stop", overallDuration: (Date.now() - startedAtQ) / 1000, streamComplete: true }))
+          await stream.writeSSE({ data: "[DONE]" })
+        })
+      }
+      // altimate_change end
+
       const firePrompt = () =>
         SessionPrompt.prompt({
           sessionID,
@@ -533,6 +637,7 @@ export const OpenAIRoutes = lazy(() =>
         let errored: string | undefined
         const { done, unsubscribe, finish, sqlSteps } = consumeSession({
           sessionID,
+          sessionKey: chatKey,
           emit: (kind, payload) => {
             if (kind === "text" && payload.content) text += payload.content
           },
@@ -584,6 +689,7 @@ export const OpenAIRoutes = lazy(() =>
 
         const { done, unsubscribe, finish, sqlSteps } = consumeSession({
           sessionID,
+          sessionKey: chatKey,
           emit: (kind, payload) => {
             if (kind === "text" && payload.content) {
               void write(
