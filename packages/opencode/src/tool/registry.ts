@@ -56,6 +56,7 @@ import { pathToFileURL } from "url"
 
 // altimate_change start - import custom data engineering tools
 import { SqlExecuteTool } from "../altimate/tools/sql-execute"
+import { PlotDataframeTool } from "../altimate/tools/plot-dataframe"
 import { SchemaInspectTool } from "../altimate/tools/schema-inspect"
 import { SqlAnalyzeTool } from "../altimate/tools/sql-analyze"
 import { SqlOptimizeTool } from "../altimate/tools/sql-optimize"
@@ -386,6 +387,7 @@ export namespace ToolRegistry {
       ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [PlanExitTool] : []),
       // altimate_change start - register custom data engineering tools
       SqlExecuteTool,
+      PlotDataframeTool,
       SchemaInspectTool,
       SqlAnalyzeTool,
       SqlOptimizeTool,

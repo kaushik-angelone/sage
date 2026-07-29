@@ -17,6 +17,7 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
                                       so headings/lists don't glue mid-line.
   * reasoning deltas              -> forwarded as `delta.reasoning_content` for
                                       Open WebUI's native Thought collapsible.
+  * Rich UI Embed tool call       -> chart HTML emitted as Open WebUI `embeds`.
   * completion sentinel           -> a "Complete in Xs" done status pill.
                                       Final SQL is streamed by the bridge as
                                       ordinary text before this sentinel.
@@ -28,6 +29,7 @@ The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):
                                          "status": "completed" | "error",
                                          "error": <message>}
                    `status` / `error` are absent on older binaries.
+  - chart embed:   tool call name "Rich UI Embed", args.embeds = [html, ...]
   - reasoning:     delta.reasoning_content = <thought text>
   - final chunk:   choices[0].finish_reason = "stop",
                    choices[0].stream_complete = true,
@@ -74,6 +76,7 @@ TOOL_LABELS = {
     "question": "❓ Asking a question",
     "plan_enter": "🧠 Entering plan mode",
     "plan_exit": "🧠 Exiting plan mode",
+    "plot_dataframe": "📊 Plotting chart",
 }
 
 
@@ -112,7 +115,61 @@ ARG_PREVIEW = {
     "task": lambda a: a.get("description"),
     "skill": lambda a: a.get("name"),
     "question": lambda a: a.get("question"),
+    "plot_dataframe": lambda a: a.get("title")
+    or (
+        f"{a.get('kind', 'bar')}: {a.get('y')} by {a.get('x')}"
+        if a.get("x") and a.get("y")
+        else a.get("sql") or a.get("kind")
+    ),
 }
+
+# OWUI wraps each Rich UI embed in a sandboxed iframe. The document must
+# postMessage its height to that parent. Split "</scr" + "ipt>" so pasting into
+# OWUI's HTML editor does not break the script tag.
+_IFRAME_HEIGHT_SCRIPT = (
+    "<script>\n"
+    "(function () {\n"
+    "  function reportHeight() {\n"
+    "    var h = Math.max(\n"
+    "      document.documentElement ? document.documentElement.scrollHeight : 0,\n"
+    "      document.body ? document.body.scrollHeight : 0\n"
+    "    );\n"
+    "    if (h > 0) {\n"
+    "      parent.postMessage({ type: 'iframe:height', height: h }, '*');\n"
+    "    }\n"
+    "  }\n"
+    "  window.addEventListener('load', reportHeight);\n"
+    "  [50, 250, 1000, 2000].forEach(function (ms) {\n"
+    "    setTimeout(reportHeight, ms);\n"
+    "  });\n"
+    "  if (window.ResizeObserver) {\n"
+    "    var target = document.body || document.documentElement;\n"
+    "    if (target) {\n"
+    "      new ResizeObserver(reportHeight).observe(target);\n"
+    "    }\n"
+    "  }\n"
+    "})();\n"
+    "</"
+    "script>\n"
+)
+
+
+def _ensure_iframe_height_script(html: str) -> str:
+    """Inject height-reporting script into HTML that OWUI will embed as an iframe."""
+    prepared = (html or "").strip()
+    if not prepared:
+        return prepared
+    if "iframe:height" not in prepared and not prepared.lstrip().lower().startswith(
+        "<iframe"
+    ):
+        lower = prepared.lower()
+        if "</body>" in lower:
+            idx = lower.rfind("</body>")
+            prepared = prepared[:idx] + _IFRAME_HEIGHT_SCRIPT + prepared[idx:]
+        else:
+            prepared = prepared + _IFRAME_HEIGHT_SCRIPT
+    return prepared
+
 
 # Fallback preview keys for unknown / project-specific tools (checked in order).
 GENERIC_PREVIEW_KEYS = (
@@ -256,6 +313,31 @@ class Filter:
                 "data": {"description": description, "done": done},
             }
         )
+
+    async def _emit_rich_ui_embeds(self, args: dict, __event_emitter__) -> bool:
+        """Emit chart HTML via Rich UI embeds. Return True if handled (drop chunk)."""
+        embeds = args.get("embeds") or []
+        if not isinstance(embeds, list) or not embeds or __event_emitter__ is None:
+            return True
+        cleaned = []
+        for item in embeds:
+            if item is None:
+                continue
+            html = str(item).strip()
+            if not html:
+                continue
+            cleaned.append(_ensure_iframe_height_script(html))
+        if cleaned:
+            await __event_emitter__(
+                {
+                    "type": "embeds",
+                    "data": {
+                        "embeds": cleaned,
+                        "replace": False,
+                    },
+                }
+            )
+        return True
 
     async def _emit_complete(self, turn: dict, duration: object, __event_emitter__) -> None:
         if turn["complete_emitted"] or __event_emitter__ is None:
@@ -405,6 +487,12 @@ class Filter:
         if payload is not None:
             kind, tool_name, args = payload
             if kind == "call":
+                # Silent chart delivery (mirrors data-agent Rich UI Embed path).
+                if tool_name == "Rich UI Embed":
+                    await self._emit_rich_ui_embeds(
+                        args if isinstance(args, dict) else {}, __event_emitter__
+                    )
+                    return None
                 await self._emit_status(
                     self._status_for_tool(tool_name, args), False, __event_emitter__
                 )

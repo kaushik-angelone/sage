@@ -62,10 +62,21 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 | --- | --- |
 | tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. For SQL tools the preview is the agent's `reason`. |
 | tool response (`{"name","duration","status","error"}`) | Dropped from the message body. |
+| Rich UI Embed (`args.embeds`) | Emits Open WebUI `embeds` (Plotly charts from `plot_dataframe`). |
 | reasoning (`delta.reasoning_content`) | Forwarded for Open WebUI’s native Thought collapsible. |
 | plain text | Forwarded; if a chunk starts with a markdown block marker (`#`, `-`, `*`, …) and the previous chunk ended with a full stop (`.`), a newline is prefixed. |
 | completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. Final SQL is streamed by the bridge as ordinary text just before this sentinel. |
 | error | Emits a "❌ Error occurred." pill. |
+
+### Plotting in chat
+
+Ask the agent to chart query results (e.g. “plot revenue by month”). It should
+call `plot_dataframe` with `sql`, `x`, `y`, and `kind`. The bridge ships chart
+HTML as a silent `Rich UI Embed` tool call; this filter turns that into an
+inline iframe.
+
+Re-paste `filter.py` into Open WebUI after pulling this change, and rebuild /
+restart `altimate serve` so the new tool and bridge emit path are live.
 
 Detection is content-based (it parses the `{"name", ...}` payload), so it does not
 depend on Open WebUI forwarding the custom `message_type` field.

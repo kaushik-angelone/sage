@@ -249,6 +249,8 @@ export const layer = Layer.effect(
                 "*": "deny",
                 // SQL read tools
                 sql_execute: "allow",
+                // Charts: writes only under XDG cache (not the project tree)
+                plot_dataframe: "allow",
                 altimate_core_validate: "allow",
                 sql_analyze: "allow",
                 sql_translate: "allow",

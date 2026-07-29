@@ -6,6 +6,7 @@ const TOOLS = [
   ...Array.from({ length: 20 }, (_, i) => ({ name: `warehouse_op${i}`, description: `warehouse operation ${i}` })),
   { name: "dbt_run", description: "run dbt models build" },
   { name: "sql_execute", description: "execute SQL query against warehouse" },
+  { name: "plot_dataframe", description: "create interactive Plotly chart from SQL or rows" },
 ]
 
 describe("Retrieval.select", () => {

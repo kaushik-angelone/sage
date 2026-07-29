@@ -286,6 +286,9 @@ function trackPreValidation(
 }
 // altimate_change end
 
+/** Max rows to attach as JSON for follow-up tools like plot_dataframe. */
+const JSON_RECORDS_LIMIT = 500
+
 function formatResult(result: SqlExecuteResult): string {
   if (result.row_count === 0) return "(0 rows)"
 
@@ -295,5 +298,17 @@ function formatResult(result: SqlExecuteResult): string {
 
   let output = `${header}\n${separator}\n${rows}\n\n(${result.row_count} rows)`
   if (result.truncated) output += " [truncated]"
+
+  // Row objects the model can pass straight into plot_dataframe.data.
+  if (result.rows.length > 0 && result.rows.length <= JSON_RECORDS_LIMIT) {
+    const records = result.rows.map((r) => {
+      const obj: Record<string, unknown> = {}
+      for (let i = 0; i < result.columns.length; i++) {
+        obj[result.columns[i]!] = r[i] ?? null
+      }
+      return obj
+    })
+    output += `\n\n\`\`\`json\n${JSON.stringify(records)}\n\`\`\``
+  }
   return output
 }

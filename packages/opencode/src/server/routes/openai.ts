@@ -192,9 +192,26 @@ function sqlStepFromInput(input: unknown): SqlStep | undefined {
 // the full SQL there is unnecessary (Final SQL is streamed at end-of-turn) and
 // can break the filter when a large statement is truncated mid-SSE — the pill
 // then silently disappears. Keep the status payload small and self-describing.
+function extractEmbeds(metadata: unknown): string[] {
+  if (!metadata || typeof metadata !== "object") return []
+  const embeds = (metadata as { embeds?: unknown }).embeds
+  if (!Array.isArray(embeds)) return []
+  return embeds
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((html) => html.length > 0)
+}
+
 function argsForOwui(tool: string, input: unknown): Record<string, unknown> {
   const args =
     input && typeof input === "object" ? { ...(input as Record<string, unknown>) } : ({} as Record<string, unknown>)
+  if (tool === "plot_dataframe") {
+    // Drop bulky row payloads / long SQL from status pills and SSE tool-call chunks.
+    if (Array.isArray(args.data)) args.data = `[${args.data.length} rows]`
+    if (typeof args.sql === "string" && args.sql.length > 120) {
+      args.sql = `${args.sql.slice(0, 120)}…`
+    }
+    return args
+  }
   if (tool !== "sql_execute") return args
 
   const reason = typeof args["reason"] === "string" ? args["reason"].trim() : ""
@@ -434,6 +451,15 @@ function consumeSession(input: {
             status: state.status === "error" || error ? "error" : "completed",
             error,
           })
+          // Charts: plot_dataframe (and any tool) can put HTML in metadata.embeds.
+          // Emit a silent "Rich UI Embed" tool-call the OWUI filter turns into iframes
+          // (same contract as data-agent owui_client_v5).
+          if (state.status === "completed" && !error) {
+            const embeds = extractEmbeds(state.metadata)
+            if (embeds.length > 0) {
+              emit("tool_call", { name: "Rich UI Embed", args: { embeds } })
+            }
+          }
           return
         }
       }
