@@ -114,7 +114,10 @@ ARG_PREVIEW = {
     "codesearch": lambda a: a.get("query"),
     "task": lambda a: a.get("description"),
     "skill": lambda a: a.get("name"),
-    "question": lambda a: a.get("question"),
+    "question": lambda a: a.get("question") or next(
+        (q.get("question") for q in (a.get("questions") or []) if isinstance(q, dict) and q.get("question")),
+        None,
+    ),
     "plot_dataframe": lambda a: a.get("title")
     or (
         f"{a.get('kind', 'bar')}: {a.get('y')} by {a.get('x')}"
@@ -493,8 +496,12 @@ class Filter:
                         args if isinstance(args, dict) else {}, __event_emitter__
                     )
                     return None
+                # The `question` tool ends the turn immediately after emitting
+                # the question text into the message body; mark it done so OWUI
+                # closes the spinner and the text below is visible right away.
+                is_blocking = tool_name == "question"
                 await self._emit_status(
-                    self._status_for_tool(tool_name, args), False, __event_emitter__
+                    self._status_for_tool(tool_name, args), is_blocking, __event_emitter__
                 )
             # Both tool call and tool response chunks are dropped from the body.
             return None

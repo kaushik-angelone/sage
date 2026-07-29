@@ -583,9 +583,6 @@ export const OpenAIRoutes = lazy(() =>
       const pendingQuestionID = pendingOwuiQuestions.get(chatKey)
       if (pendingQuestionID) {
         pendingOwuiQuestions.delete(chatKey)
-        Question.reply({ requestID: pendingQuestionID, answers: [[userMessage]] }).catch((err) =>
-          log.error("question reply failed", { error: err instanceof Error ? err.message : String(err) }),
-        )
         // Wait for the agent to finish processing the answer and produce output.
         const completionIDQ = `chatcmpl-${sessionID}-q-${Date.now().toString(36)}`
         if (!wantStream) {
@@ -599,9 +596,13 @@ export const OpenAIRoutes = lazy(() =>
             },
             onError: (message) => { errored = message },
           })
+          // Reply fires the agent; .finally(finish) ensures done resolves even if
+          // session.status → idle races ahead of our subscription.
+          Question.reply({ requestID: pendingQuestionID, answers: [[userMessage]] })
+            .finally(finish)
+            .catch((err) => log.error("question reply failed", { error: err instanceof Error ? err.message : String(err) }))
           try {
             await done
-            finish()
           } finally {
             unsubscribe()
           }
@@ -632,9 +633,14 @@ export const OpenAIRoutes = lazy(() =>
             onError: (message) => { void write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: `\n\n**Error:** ${message}` } })) },
           })
           stream.onAbort(() => { unsubscribe(); SessionPrompt.cancel(sessionID).catch(() => { }) })
+          // Reply fires the agent; .finally(finish) mirrors firePrompt().finally(finish)
+          // in the normal path — guards against session.status → idle racing ahead of
+          // the Bus subscription so done always resolves and the sentinel is emitted.
+          Question.reply({ requestID: pendingQuestionID, answers: [[userMessage]] })
+            .finally(finish)
+            .catch((err) => log.error("question reply failed", { error: err instanceof Error ? err.message : String(err) }))
           try {
             await done
-            finish()
           } finally {
             unsubscribe()
           }
