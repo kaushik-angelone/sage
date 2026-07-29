@@ -63,9 +63,10 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 | tool call (`{"name","args"}`) | Emits a status pill (friendly label + arg preview); drops the raw JSON. For SQL tools the preview is the agent's `reason`. |
 | tool response (`{"name","duration","status","error"}`) | Dropped from the message body. |
 | Rich UI Embed (`args.embeds`) | Emits Open WebUI `embeds` (Plotly charts from `plot_dataframe`). |
+| Execution Complete (`args.duration`) | Emits a "✅ Complete in Xs" done pill (preferred path). |
 | reasoning (`delta.reasoning_content`) | Forwarded for Open WebUI’s native Thought collapsible. |
 | plain text | Forwarded; if a chunk starts with a markdown block marker (`#`, `-`, `*`, …) and the previous chunk ended with a full stop (`.`), a newline is prefixed. |
-| completion sentinel (`stream_complete` / `finish_reason: stop`) | Emits a "✅ Complete in Xs" done pill. Final SQL is streamed by the bridge as ordinary text just before this sentinel. |
+| completion sentinel (`stream_complete` / `finish_reason: stop`) | Backup for the Complete pill if the tool-call signal was missed. Final SQL is streamed as ordinary text just before completion. |
 | error | Emits a "❌ Error occurred." pill. |
 
 ### Plotting in chat

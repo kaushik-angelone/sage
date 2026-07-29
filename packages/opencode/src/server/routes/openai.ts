@@ -163,6 +163,22 @@ function chunk(input: {
   }
 }
 
+/** OWUI often strips custom choice fields; the filter keys off this tool-call name. */
+function executionCompleteChunk(input: { id: string; model: string; durationSec: number }) {
+  return chunk({
+    id: input.id,
+    model: input.model,
+    author: "tool call",
+    messageType: "tool call",
+    delta: {
+      content: JSON.stringify({
+        name: "Execution Complete",
+        args: { duration: input.durationSec },
+      }),
+    },
+  })
+}
+
 // altimate_change start — end-of-turn SQL recap
 interface SqlStep {
   query: string
@@ -646,7 +662,10 @@ export const OpenAIRoutes = lazy(() =>
           }
           const recap = renderSqlRecap(sqlSteps)
           if (recap) await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: recap } }))
-          await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: {}, finishReason: "stop", overallDuration: (Date.now() - startedAtQ) / 1000, streamComplete: true }))
+          const durationQ = (Date.now() - startedAtQ) / 1000
+          // Content-based completion signal — survives OWUI stripping custom choice fields.
+          await write(executionCompleteChunk({ id: completionIDQ, model, durationSec: durationQ }))
+          await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: {}, finishReason: "stop", overallDuration: durationQ, streamComplete: true }))
           await stream.writeSSE({ data: "[DONE]" })
         })
       }
@@ -823,8 +842,14 @@ export const OpenAIRoutes = lazy(() =>
           )
         }
 
-        // Final finish chunk + OpenAI stream terminator. Carries the total turn
-        // duration + stream_complete so the OWUI filter can show a completion pill.
+        // Completion pill: emit a silent tool-call first. Open WebUI often strips
+        // custom choice fields (stream_complete / overall_duration) before the
+        // filter's stream() hook sees them, so content-based detection is reliable
+        // (same pattern as data-agent "Plan Execution Complete").
+        const durationSec = (Date.now() - startedAt) / 1000
+        await write(executionCompleteChunk({ id: completionID, model, durationSec }))
+
+        // Final finish chunk + OpenAI stream terminator (backup sentinel).
         await write(
           chunk({
             id: completionID,
@@ -833,7 +858,7 @@ export const OpenAIRoutes = lazy(() =>
             messageType: "text",
             delta: {},
             finishReason: "stop",
-            overallDuration: (Date.now() - startedAt) / 1000,
+            overallDuration: durationSec,
             streamComplete: true,
           }),
         )

@@ -1,6 +1,11 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test"
 import * as Dispatcher from "../../src/altimate/native/dispatcher"
-import { resolveSchema, schemaOrEmpty } from "../../src/altimate/native/schema-resolver"
+import {
+  hasSchemaInput,
+  relaxValidationWithoutSchema,
+  resolveSchema,
+  schemaOrEmpty,
+} from "../../src/altimate/native/schema-resolver"
 import {
   preprocessIff,
   postprocessQualify,
@@ -29,6 +34,28 @@ describe("Schema Resolution", () => {
     const schema = schemaOrEmpty()
     expect(schema).toBeDefined()
     expect(schema.tableNames()).toContain("_empty_")
+  })
+
+  test("hasSchemaInput / relaxValidationWithoutSchema drop sentinel table errors", () => {
+    expect(hasSchemaInput()).toBe(false)
+    expect(hasSchemaInput(undefined, { users: { id: "INT" } })).toBe(true)
+    const relaxed = relaxValidationWithoutSchema({
+      valid: false,
+      errors: [
+        { kind: { type: "TableNotFound", table: "users" }, message: "Table 'users' not found" },
+        { kind: { type: "SyntaxError" }, message: "Syntax error: boom" },
+      ],
+    })
+    expect(relaxed.errors).toHaveLength(1)
+    expect((relaxed.errors as any[])[0].kind.type).toBe("SyntaxError")
+    expect(relaxed.valid).toBe(false)
+
+    const onlyTables = relaxValidationWithoutSchema({
+      valid: false,
+      errors: [{ kind: { type: "TableNotFound", table: "users" }, message: "Table 'users' not found" }],
+    })
+    expect(onlyTables.valid).toBe(true)
+    expect(onlyTables.errors).toEqual([])
   })
 
   test("resolveSchema from DDL context", () => {

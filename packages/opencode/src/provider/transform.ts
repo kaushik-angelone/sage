@@ -1408,6 +1408,7 @@ export namespace ProviderTransform {
     // altimate_change end
 
     // Convert integer enums to string enums for Google/Gemini
+    // Also used for Gemini models routed via Databricks AI Gateway (api.id contains "gemini").
     if (model.providerID === "google" || model.api.id.includes("gemini")) {
       const isPlainObject = (node: unknown): node is Record<string, any> =>
         typeof node === "object" && node !== null && !Array.isArray(node)
@@ -1434,6 +1435,35 @@ export namespace ProviderTransform {
         ].some((key) => key in node)
       }
 
+      // Gemini FunctionDeclaration.parameters is an OpenAPI Schema subset — unknown
+      // JSON Schema keywords cause 400 INVALID_ARGUMENT (esp. via Databricks AI Gateway).
+      // Keys inside `properties` / `$defs` / `definitions` are parameter names, not keywords.
+      const geminiUnsupportedKeys = new Set([
+        "$schema",
+        "$id",
+        "$comment",
+        "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+        "not",
+        "examples",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "uniqueItems",
+      ])
+      const propertyMaps = new Set(["properties", "$defs", "definitions"])
+
       const sanitizeGemini = (obj: any): any => {
         if (obj === null || typeof obj !== "object") {
           return obj
@@ -1445,6 +1475,14 @@ export namespace ProviderTransform {
 
         const result: any = {}
         for (const [key, value] of Object.entries(obj)) {
+          if (geminiUnsupportedKeys.has(key)) continue
+
+          // Preserve `const` as a single-value enum (Gemini rejects `const`)
+          if (key === "const") {
+            if (!("enum" in result)) result.enum = [typeof value === "string" ? value : String(value)]
+            continue
+          }
+
           if (key === "enum" && Array.isArray(value)) {
             // Convert all enum values to strings
             result[key] = value.map((v) => String(v))
@@ -1452,6 +1490,9 @@ export namespace ProviderTransform {
             if (result.type === "integer" || result.type === "number") {
               result.type = "string"
             }
+          } else if (propertyMaps.has(key) && isPlainObject(value)) {
+            // Do not filter property *names*; only sanitize each property schema.
+            result[key] = Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitizeGemini(item)]))
           } else if (typeof value === "object" && value !== null) {
             result[key] = sanitizeGemini(value)
           } else {

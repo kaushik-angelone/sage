@@ -1223,6 +1223,44 @@ describe("ProviderTransform.schema - gemini non-object properties removal", () =
 
     expect(result.properties.data.properties).toBeDefined()
   })
+
+  test("strips Gemini-unsupported JSON Schema keywords", () => {
+    const result = ProviderTransform.schema(geminiModel, {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        n: { type: "number", exclusiveMinimum: 0 },
+        tags: { type: "object", propertyNames: { type: "string" } },
+        mode: { const: "fast" },
+        const: { type: "string" },
+      },
+    } as any) as any
+
+    expect(result.$schema).toBeUndefined()
+    expect(result.additionalProperties).toBeUndefined()
+    expect(result.properties.n.exclusiveMinimum).toBeUndefined()
+    expect(result.properties.tags.propertyNames).toBeUndefined()
+    expect(result.properties.mode.const).toBeUndefined()
+    expect(result.properties.mode.enum).toEqual(["fast"])
+    expect(result.properties.const).toEqual({ type: "string" })
+  })
+
+  test("sanitizes Databricks AI Gateway Gemini model ids", () => {
+    const databricksGemini = {
+      providerID: "databricks",
+      api: { id: "system.ai.gemini-3-5-flash" },
+    } as any
+
+    const result = ProviderTransform.schema(databricksGemini, {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { x: { type: "string" } },
+    } as any) as any
+
+    expect(result.$schema).toBeUndefined()
+    expect(result.properties.x.type).toBe("string")
+  })
 })
 
 describe("ProviderTransform.schema - openai supported schema subset", () => {

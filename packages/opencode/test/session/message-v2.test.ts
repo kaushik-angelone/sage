@@ -1663,3 +1663,32 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
   })
 })
+
+describe("session.message-v2.withGoogleThoughtSignature", () => {
+  test("mirrors provider-keyed thoughtSignature onto google for openai-compat replay", () => {
+    const result = MessageV2.withGoogleThoughtSignature({
+      databricks: { thoughtSignature: "sig-from-gateway" },
+    })
+    expect(result).toEqual({
+      databricks: { thoughtSignature: "sig-from-gateway" },
+      google: { thoughtSignature: "sig-from-gateway" },
+    })
+  })
+
+  test("preserves an existing google.thoughtSignature", () => {
+    const result = MessageV2.withGoogleThoughtSignature({
+      databricks: { thoughtSignature: "other" },
+      google: { thoughtSignature: "keep-me", extra: true },
+    })
+    expect(result?.google).toEqual({ thoughtSignature: "keep-me", extra: true })
+  })
+
+  test("returns metadata unchanged when no thoughtSignature is present", () => {
+    const meta = { databricks: { acceptedPredictionTokens: 1 } }
+    expect(MessageV2.withGoogleThoughtSignature(meta)).toEqual(meta)
+  })
+
+  test("returns undefined for undefined input", () => {
+    expect(MessageV2.withGoogleThoughtSignature(undefined)).toBeUndefined()
+  })
+})

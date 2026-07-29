@@ -14,7 +14,15 @@
 
 import { describe, expect, test } from "bun:test"
 import {
+  databricksBaseURL,
+  ensureGeminiThoughtSignatures,
+  databricksModelIdFromAltimateModel,
+  normalizeDatabricksApiBase,
+  normalizeDatabricksGeminiResponseText,
+  normalizeDatabricksModelId,
   parseDatabricksPAT,
+  sanitizeGeminiToolParameters,
+  SKIP_THOUGHT_SIGNATURE,
   transformDatabricksBody,
   VALID_HOST_RE,
 } from "../../src/altimate/plugin/databricks"
@@ -120,6 +128,65 @@ describe("parseDatabricksPAT", () => {
 })
 
 // ---------------------------------------------------------------------------
+// API base URL
+// ---------------------------------------------------------------------------
+
+describe("normalizeDatabricksApiBase / databricksBaseURL", () => {
+  test("defaults to serving-endpoints", () => {
+    expect(normalizeDatabricksApiBase(undefined)).toBe("/serving-endpoints")
+    expect(normalizeDatabricksApiBase("")).toBe("/serving-endpoints")
+  })
+
+  test("accepts AI Gateway MLflow path", () => {
+    expect(normalizeDatabricksApiBase("/ai-gateway/mlflow/v1")).toBe("/ai-gateway/mlflow/v1")
+    expect(normalizeDatabricksApiBase("ai-gateway/mlflow/v1/")).toBe("/ai-gateway/mlflow/v1")
+  })
+
+  test("rejects host injection and traversal", () => {
+    expect(normalizeDatabricksApiBase("https://evil.example/x")).toBe("/serving-endpoints")
+    expect(normalizeDatabricksApiBase("/ai-gateway/../admin")).toBe("/serving-endpoints")
+  })
+
+  test("builds OpenAI-compatible base URL without chat/completions", () => {
+    expect(databricksBaseURL("angel-ds-dev.cloud.databricks.com", "/ai-gateway/mlflow/v1")).toBe(
+      "https://angel-ds-dev.cloud.databricks.com/ai-gateway/mlflow/v1",
+    )
+  })
+})
+
+describe("normalizeDatabricksModelId", () => {
+  test("accepts AI Gateway catalog ids", () => {
+    expect(normalizeDatabricksModelId("system.ai.gemini-3-5-flash")).toBe("system.ai.gemini-3-5-flash")
+    expect(normalizeDatabricksModelId("databricks-claude-sonnet-4-6")).toBe("databricks-claude-sonnet-4-6")
+  })
+
+  test("rejects empty and unsafe values", () => {
+    expect(normalizeDatabricksModelId("")).toBeUndefined()
+    expect(normalizeDatabricksModelId("https://evil")).toBeUndefined()
+    expect(normalizeDatabricksModelId("../x")).toBeUndefined()
+  })
+})
+
+describe("databricksModelIdFromAltimateModel", () => {
+  test("extracts id from ALTIMATE_MODEL=databricks/...", () => {
+    expect(databricksModelIdFromAltimateModel("databricks/system.ai.gemini-3-5-flash-lite")).toBe(
+      "system.ai.gemini-3-5-flash-lite",
+    )
+  })
+
+  test("ignores non-databricks providers", () => {
+    expect(databricksModelIdFromAltimateModel("google/gemini-2.5-flash")).toBeUndefined()
+    expect(databricksModelIdFromAltimateModel("google-vertex/gemini-2.5-pro")).toBeUndefined()
+  })
+
+  test("rejects malformed values", () => {
+    expect(databricksModelIdFromAltimateModel("")).toBeUndefined()
+    expect(databricksModelIdFromAltimateModel("databricks")).toBeUndefined()
+    expect(databricksModelIdFromAltimateModel("databricks/")).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Request body transforms
 // ---------------------------------------------------------------------------
 
@@ -167,6 +234,147 @@ describe("transformDatabricksBody", () => {
     expect(result.model).toBe("databricks-dbrx-instruct")
     expect(result.stream).toBe(true)
     expect(result.max_tokens).toBeUndefined()
+  })
+
+  test("strips stream_options and Gemini-unsupported tool schema keys for gemini models", () => {
+    const input = JSON.stringify({
+      model: "system.ai.gemini-3-5-flash",
+      stream: true,
+      stream_options: { include_usage: true },
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "demo",
+            parameters: {
+              $schema: "https://json-schema.org/draft/2020-12/schema",
+              type: "object",
+              properties: {
+                n: { type: "number", exclusiveMinimum: 0 },
+                tags: { type: "object", propertyNames: { type: "string" } },
+                const: { type: "string" },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+    })
+    const result = JSON.parse(transformDatabricksBody(input).body)
+    expect(result.stream_options).toBeUndefined()
+    const params = result.tools[0].function.parameters
+    expect(params.$schema).toBeUndefined()
+    expect(params.additionalProperties).toBeUndefined()
+    expect(params.properties.n.exclusiveMinimum).toBeUndefined()
+    expect(params.properties.tags.propertyNames).toBeUndefined()
+    // Parameter named `const` must be preserved
+    expect(params.properties.const).toEqual({ type: "string" })
+  })
+
+  test("keeps stream_options for non-gemini Databricks models", () => {
+    const input = JSON.stringify({
+      model: "databricks-meta-llama-3-1-70b-instruct",
+      stream_options: { include_usage: true },
+    })
+    const result = JSON.parse(transformDatabricksBody(input).body)
+    expect(result.stream_options).toEqual({ include_usage: true })
+  })
+})
+
+describe("sanitizeGeminiToolParameters", () => {
+  test("converts const keyword to enum", () => {
+    const result = sanitizeGeminiToolParameters({
+      type: "object",
+      properties: { mode: { const: "fast" } },
+    }) as any
+    expect(result.properties.mode.const).toBeUndefined()
+    expect(result.properties.mode.enum).toEqual(["fast"])
+  })
+})
+
+describe("ensureGeminiThoughtSignatures", () => {
+  test("injects skip token when tool_calls lack thought_signature", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        tool_calls: [{ id: "1", type: "function", function: { name: "read", arguments: "{}" } }],
+      },
+    ]
+    ensureGeminiThoughtSignatures(messages)
+    expect(messages[1].tool_calls[0].thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE)
+    expect(messages[1].tool_calls[0].extra_content.google.thought_signature).toBe(SKIP_THOUGHT_SIGNATURE)
+  })
+
+  test("preserves Databricks top-level thoughtSignature and mirrors to extra_content", () => {
+    const messages = [
+      {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "1",
+            type: "function",
+            function: { name: "read", arguments: "{}" },
+            thoughtSignature: "real-sig-from-gateway",
+          },
+        ],
+      },
+    ]
+    ensureGeminiThoughtSignatures(messages)
+    expect(messages[0].tool_calls[0].thoughtSignature).toBe("real-sig-from-gateway")
+    expect(messages[0].tool_calls[0].extra_content.google.thought_signature).toBe("real-sig-from-gateway")
+  })
+})
+
+describe("normalizeDatabricksGeminiResponseText", () => {
+  test("maps Databricks thoughtSignature onto extra_content for AI SDK", () => {
+    const sse = [
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  id: "read",
+                  type: "function",
+                  function: { name: "read", arguments: "{}" },
+                  thoughtSignature: "sig-abc",
+                },
+              ],
+            },
+          },
+        ],
+      })}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n")
+
+    const out = normalizeDatabricksGeminiResponseText(sse)
+    const line = out.split("\n").find((l) => l.startsWith("data: {"))!
+    const payload = JSON.parse(line.slice(5).trim())
+    const call = payload.choices[0].delta.tool_calls[0]
+    expect(call.thoughtSignature).toBe("sig-abc")
+    expect(call.extra_content.google.thought_signature).toBe("sig-abc")
+  })
+})
+
+describe("transformDatabricksBody thought signatures", () => {
+  test("injects thoughtSignature on gemini tool-call history", () => {
+    const input = JSON.stringify({
+      model: "system.ai.gemini-3-5-flash",
+      messages: [
+        { role: "user", content: "read foo" },
+        {
+          role: "assistant",
+          tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "c1", content: "ok" },
+      ],
+    })
+    const result = JSON.parse(transformDatabricksBody(input).body)
+    expect(result.messages[1].tool_calls[0].thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE)
+    expect(result.messages[1].tool_calls[0].extra_content.google.thought_signature).toBe(SKIP_THOUGHT_SIGNATURE)
   })
 })
 

@@ -111,6 +111,11 @@ export function resolveSchema(
 /**
  * Resolve a Schema, falling back to a minimal empty schema when none is provided.
  * Use this for functions that require a non-null Schema argument.
+ *
+ * WARNING: the fallback schema only contains `_empty_`. Callers that run
+ * `validate` / `lint` without a real schema MUST strip TableNotFound /
+ * ColumnNotFound findings afterward (see `relaxValidationWithoutSchema`),
+ * otherwise every real table reference falsely fails.
  */
 export function schemaOrEmpty(
   schemaPath?: string,
@@ -119,4 +124,40 @@ export function schemaOrEmpty(
   const s = resolveSchema(schemaPath, schemaContext)
   if (s !== null) return s
   return Schema.fromDdl("CREATE TABLE _empty_ (id INT);")
+}
+
+/** True when the caller supplied a usable schema_path or schema_context. */
+export function hasSchemaInput(
+  schemaPath?: string,
+  schemaContext?: Record<string, any>,
+): boolean {
+  if (typeof schemaPath === "string" && schemaPath.trim().length > 0) return true
+  return !!(schemaContext && Object.keys(schemaContext).length > 0)
+}
+
+const SCHEMA_DEPENDENT_KINDS = new Set(["TableNotFound", "ColumnNotFound", "AmbiguousColumn"])
+
+/**
+ * When validate runs against the `_empty_` sentinel schema, drop table/column
+ * existence errors so syntax-only validation matches the tool contract.
+ */
+export function relaxValidationWithoutSchema(data: Record<string, unknown>): Record<string, unknown> {
+  const errors = Array.isArray(data.errors) ? data.errors : []
+  const filtered = errors.filter((err) => {
+    if (!err || typeof err !== "object") return true
+    const kind = (err as { kind?: { type?: string } }).kind
+    const type = kind && typeof kind === "object" ? kind.type : undefined
+    if (type && SCHEMA_DEPENDENT_KINDS.has(type)) return false
+    if (!type) {
+      const msg = String((err as { message?: unknown }).message ?? "").toLowerCase()
+      if (msg.includes("table") && msg.includes("not found")) return false
+      if (msg.includes("column") && msg.includes("not found")) return false
+    }
+    return true
+  })
+  return {
+    ...data,
+    errors: filtered,
+    valid: filtered.length === 0,
+  }
 }

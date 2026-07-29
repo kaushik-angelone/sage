@@ -31,6 +31,40 @@ export namespace MessageV2 {
     return mime.startsWith("image/") || mime === "application/pdf"
   }
 
+  /**
+   * @ai-sdk/openai-compatible only echoes thought signatures from
+   * `providerOptions.google.thoughtSignature`, but stores inbound signatures
+   * under the provider name (e.g. `databricks.thoughtSignature`). Mirror any
+   * found signature onto `google` so multi-step Gemini tool loops work.
+   */
+  export function withGoogleThoughtSignature(
+    metadata: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!metadata || typeof metadata !== "object") return metadata
+    const google = metadata.google
+    if (
+      google &&
+      typeof google === "object" &&
+      typeof (google as { thoughtSignature?: unknown }).thoughtSignature === "string" &&
+      (google as { thoughtSignature: string }).thoughtSignature.length > 0
+    ) {
+      return metadata
+    }
+    for (const value of Object.values(metadata)) {
+      if (!value || typeof value !== "object") continue
+      const sig = (value as { thoughtSignature?: unknown }).thoughtSignature
+      if (typeof sig !== "string" || !sig) continue
+      return {
+        ...metadata,
+        google: {
+          ...(google && typeof google === "object" ? google : {}),
+          thoughtSignature: sig,
+        },
+      }
+    }
+    return metadata
+  }
+
   // altimate_change start — shared synthetic-attachment prompt text. Used both when
   // injecting tool-result media as a user message (below) and by the GitHub Copilot
   // plugin's imgMsg() heuristic so the two stay in sync.
@@ -813,18 +847,22 @@ export namespace MessageV2 {
                     }
                   : outputText
 
+              // altimate_change start — mirror thoughtSignature onto google for Gemini openai-compat
+              const callMeta = differentModel ? undefined : withGoogleThoughtSignature(part.metadata)
               assistantMessage.parts.push({
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-available",
                 toolCallId: part.callID,
                 input: part.state.input,
                 output,
-                ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
+                ...(callMeta ? { callProviderMetadata: callMeta } : {}),
               })
+              // altimate_change end
             }
             if (part.state.status === "error") {
               // altimate_change start — upstream_fix: preserve partial output from aborted tools.
               const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
+              const callMeta = differentModel ? undefined : withGoogleThoughtSignature(part.metadata)
               if (typeof output === "string") {
                 assistantMessage.parts.push({
                   type: ("tool-" + part.tool) as `tool-${string}`,
@@ -832,7 +870,7 @@ export namespace MessageV2 {
                   toolCallId: part.callID,
                   input: part.state.input,
                   output,
-                  ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
+                  ...(callMeta ? { callProviderMetadata: callMeta } : {}),
                 })
               } else {
                 assistantMessage.parts.push({
@@ -841,22 +879,26 @@ export namespace MessageV2 {
                   toolCallId: part.callID,
                   input: part.state.input,
                   errorText: part.state.error,
-                  ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
+                  ...(callMeta ? { callProviderMetadata: callMeta } : {}),
                 })
               }
               // altimate_change end
             }
             // Handle pending/running tool calls to prevent dangling tool_use blocks
             // Anthropic/Claude APIs require every tool_use to have a corresponding tool_result
-            if (part.state.status === "pending" || part.state.status === "running")
+            if (part.state.status === "pending" || part.state.status === "running") {
+              // altimate_change start — mirror thoughtSignature onto google for Gemini openai-compat
+              const callMeta = differentModel ? undefined : withGoogleThoughtSignature(part.metadata)
               assistantMessage.parts.push({
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-error",
                 toolCallId: part.callID,
                 input: part.state.input,
                 errorText: "[Tool execution was interrupted]",
-                ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
+                ...(callMeta ? { callProviderMetadata: callMeta } : {}),
               })
+              // altimate_change end
+            }
           }
           if (part.type === "reasoning") {
             assistantMessage.parts.push({

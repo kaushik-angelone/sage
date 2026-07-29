@@ -18,9 +18,12 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
   * reasoning deltas              -> forwarded as `delta.reasoning_content` for
                                       Open WebUI's native Thought collapsible.
   * Rich UI Embed tool call       -> chart HTML emitted as Open WebUI `embeds`.
-  * completion sentinel           -> a "Complete in Xs" done status pill.
+  * Execution Complete tool call  -> "✅ Complete in Xs" done status pill
+                                      (preferred; survives OWUI stripping custom
+                                      choice fields). Backup: stream_complete /
+                                      finish_reason stop / outlet fallback.
                                       Final SQL is streamed by the bridge as
-                                      ordinary text before this sentinel.
+                                      ordinary text before this signal.
   * `message_type: "error"`       -> an error status pill.
 
 The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):
@@ -30,6 +33,7 @@ The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):
                                          "error": <message>}
                    `status` / `error` are absent on older binaries.
   - chart embed:   tool call name "Rich UI Embed", args.embeds = [html, ...]
+  - turn done:     tool call name "Execution Complete", args.duration = <seconds>
   - reasoning:     delta.reasoning_content = <thought text>
   - final chunk:   choices[0].finish_reason = "stop",
                    choices[0].stream_complete = true,
@@ -495,6 +499,12 @@ class Filter:
                     await self._emit_rich_ui_embeds(
                         args if isinstance(args, dict) else {}, __event_emitter__
                     )
+                    return None
+                # Preferred completion signal — content-based so it works even
+                # when OWUI drops stream_complete / overall_duration from choices.
+                if tool_name in ("Execution Complete", "Plan Execution Complete"):
+                    duration = args.get("duration") if isinstance(args, dict) else None
+                    await self._emit_complete(turn, duration, __event_emitter__)
                     return None
                 # The `question` tool ends the turn immediately after emitting
                 # the question text into the message body; mark it done so OWUI

@@ -10,7 +10,12 @@
 
 import * as core from "@altimateai/altimate-core"
 import { register } from "./dispatcher"
-import { schemaOrEmpty, resolveSchema } from "./schema-resolver"
+import {
+  schemaOrEmpty,
+  resolveSchema,
+  hasSchemaInput,
+  relaxValidationWithoutSchema,
+} from "./schema-resolver"
 import type { AltimateCoreResult } from "./types"
 
 // ---------------------------------------------------------------------------
@@ -90,7 +95,13 @@ export function registerAll(): void {
     try {
       const schema = schemaOrEmpty(params.schema_path, params.schema_context)
       const raw = await core.validate(params.sql, schema)
-      const data = toData(raw)
+      let data = toData(raw)
+      // Without a real schema we validate against a sentinel `_empty_` table.
+      // Drop the resulting false TableNotFound / ColumnNotFound findings so
+      // syntax-only checks match the tool's documented contract.
+      if (!hasSchemaInput(params.schema_path, params.schema_context)) {
+        data = relaxValidationWithoutSchema(data)
+      }
       return ok(true, data)
     } catch (e) {
       return fail(e)
@@ -169,6 +180,10 @@ export function registerAll(): void {
     try {
       const schema = schemaOrEmpty(params.schema_path, params.schema_context)
       const validation = await core.validate(params.sql, schema)
+      let validationData = toData(validation)
+      if (!hasSchemaInput(params.schema_path, params.schema_context)) {
+        validationData = relaxValidationWithoutSchema(validationData)
+      }
       // Diff-scoped lint: when a base SQL is supplied, core returns only the
       // findings the change INTRODUCED (pre-existing issues in the file are
       // dropped) — the structural comparison stays in the AST engine.
@@ -182,7 +197,7 @@ export function registerAll(): void {
           : core.lint(params.sql, schema)
       const safety = core.scanSql(params.sql)
       const data: Record<string, unknown> = {
-        validation: toData(validation),
+        validation: validationData,
         lint: toData(lintResult),
         safety: toData(safety),
       }

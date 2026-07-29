@@ -66,7 +66,13 @@ import { ModelID, ProviderID } from "./schema"
 import { VALID_ACCOUNT_RE } from "../altimate/plugin/snowflake"
 // altimate_change end
 // altimate_change start — databricks host validation
-import { isValidDatabricksHost } from "../altimate/plugin/databricks"
+import {
+  databricksBaseURL,
+  databricksFetch,
+  databricksModelIdFromAltimateModel,
+  isValidDatabricksHost,
+  wrapDatabricksFetch,
+} from "../altimate/plugin/databricks"
 // altimate_change end
 
 // altimate_change start — raise SSE chunk-timeout watchdog 2min→5min (#844) for slow warehouse/LLM streams
@@ -896,7 +902,41 @@ export namespace Provider {
     },
     // altimate_change end
     // altimate_change start — databricks provider loader
-    databricks: async () => {
+    databricks: async (input) => {
+      const apiBase = Env.get("DATABRICKS_API_BASE")
+      // Register catalog ids from ALTIMATE_MODEL=databricks/<id> (e.g. system.ai.*)
+      // so they work without a hardcoded models map entry.
+      const envModel = databricksModelIdFromAltimateModel(Env.get("ALTIMATE_MODEL"))
+      if (envModel) {
+        const modelID = ModelID.make(envModel)
+        if (!input.models[modelID]) {
+          const short = envModel.split(".").pop() || envModel
+          input.models[modelID] = {
+            id: modelID,
+            providerID: ProviderID.databricks,
+            api: { id: envModel, url: "", npm: "@ai-sdk/openai-compatible" },
+            name: short,
+            capabilities: {
+              temperature: true,
+              reasoning: true,
+              attachment: false,
+              toolcall: true,
+              input: { text: true, audio: false, image: false, video: false, pdf: false },
+              output: { text: true, audio: false, image: false, video: false, pdf: false },
+              interleaved: false,
+            },
+            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            limit: { context: 200_000, output: 16_384 },
+            status: "active",
+            options: {},
+            headers: {},
+            release_date: "2024-01-01",
+            variants: {},
+          }
+          input.models[modelID].variants = mapValues(ProviderTransform.variants(input.models[modelID]), (v) => v)
+        }
+      }
+
       const auth = await Auth.get("databricks")
       if (auth?.type !== "oauth") {
         // Fall back to env-based config
@@ -909,8 +949,11 @@ export namespace Provider {
         return {
           autoload: true,
           options: {
-            baseURL: `https://${host}/serving-endpoints`,
+            baseURL: databricksBaseURL(host, apiBase),
             apiKey: token,
+            // Gemini AI Gateway rejects stream_options / loose tool schemas.
+            includeUsage: false,
+            fetch: databricksFetch,
           },
         }
       }
@@ -921,7 +964,8 @@ export namespace Provider {
       return {
         autoload: true,
         options: {
-          baseURL: `https://${host}/serving-endpoints`,
+          baseURL: databricksBaseURL(host, apiBase),
+          includeUsage: false,
         },
       }
     },
@@ -1404,6 +1448,12 @@ export namespace Provider {
           context: 1000000,
           output: 8192,
         }),
+        // AI Gateway catalog id (MLflow OpenAI API: /ai-gateway/mlflow/v1)
+        "system.ai.gemini-3-5-flash": makeDatabricksModel(
+          "system.ai.gemini-3-5-flash",
+          "Gemini 3.5 Flash (AI Gateway)",
+          { context: 1000000, output: 8192 },
+        ),
         // DBRX — Databricks native model
         "databricks-dbrx-instruct": makeDatabricksModel("databricks-dbrx-instruct", "DBRX Instruct", {
           context: 32768,
@@ -1775,6 +1825,23 @@ export namespace Provider {
       if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
         options["includeUsage"] = true
       }
+
+      // altimate_change start — always rewrite Databricks→Gemini requests (thought_signature,
+      // schema keywords, stream_options). Do not rely solely on loader-provided fetch; config
+      // apiKey paths can omit it.
+      if (String(model.providerID) === "databricks") {
+        options["includeUsage"] = false
+        const inner = typeof options["fetch"] === "function" ? options["fetch"] : fetch
+        options["fetch"] = wrapDatabricksFetch(inner)
+        if (process.env["DEBUG_DATABRICKS_BODY"] === "1") {
+          log.info("databricks fetch wrap installed", {
+            modelID: model.id,
+            apiID: model.api.id,
+            hasInnerFetch: typeof inner === "function",
+          })
+        }
+      }
+      // altimate_change end
 
       const baseURL = iife(() => {
         let url =

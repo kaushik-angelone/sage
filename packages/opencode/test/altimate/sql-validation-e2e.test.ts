@@ -237,14 +237,16 @@ describe("altimate_core_validate e2e", () => {
     expect(result.data.valid).not.toBe(false)
   })
 
-  test("query referencing unknown table without schema still returns result", async () => {
-    // Without schema context, table references can't be verified —
-    // the handler returns valid=false which maps to success=false
+  test("query referencing unknown table without schema is syntax-valid (no false table-not-found)", async () => {
+    // Without schema context we must NOT fail on TableNotFound against the
+    // sentinel `_empty_` schema — only syntax / dialect checks apply.
     const result = await Dispatcher.call("altimate_core.validate", {
       sql: "SELECT id, name FROM users WHERE id = 1",
     })
-    expect(result).toHaveProperty("success")
-    expect(result).toHaveProperty("data")
+    expect(result.success).toBe(true)
+    expect(result.data.valid).toBe(true)
+    const errors = Array.isArray(result.data.errors) ? result.data.errors : []
+    expect(errors.some((e: any) => String(e?.message ?? "").toLowerCase().includes("table"))).toBe(false)
   })
 
   test("CTE query returns result shape", async () => {

@@ -171,6 +171,20 @@ If `location` is not set, it defaults to `us-central1`.
 !!! tip
     You can also access Anthropic models through Vertex AI using the `google-vertex` provider (e.g., `google-vertex/claude-sonnet-4-6`).
 
+## Selecting provider/model via env (portable)
+
+Set one env var — the full `provider/model` id:
+
+```bash
+ALTIMATE_MODEL=databricks/system.ai.gemini-3-5-flash
+# ALTIMATE_MODEL=google/gemini-2.5-flash
+# ALTIMATE_MODEL=google-vertex/gemini-2.5-pro
+```
+
+`run.sh` exports a default if unset (`databricks/system.ai.gemini-3-5-flash`).  
+`altimate-code.json` reads `${ALTIMATE_MODEL:-...}` for `model` / agent models.  
+When the provider is `databricks`, the model id after `/` is also registered dynamically (catalog ids like `system.ai.*`).
+
 ## Ollama (Local)
 
 ```json
@@ -343,11 +357,20 @@ Or set environment variables:
 ```bash
 export DATABRICKS_HOST=myworkspace.cloud.databricks.com
 export DATABRICKS_TOKEN=dapi1234567890abcdef
+# Optional — OpenAI-compatible API path under the host (default: /serving-endpoints)
+# For AI Gateway catalog models (system.ai.*), use the MLflow path:
+export DATABRICKS_API_BASE=/ai-gateway/mlflow/v1
+# Full provider/model (portable):
+export ALTIMATE_MODEL=databricks/system.ai.gemini-3-5-flash
 ```
+
+Point the agent at it with `"model": "${ALTIMATE_MODEL:-databricks/system.ai.gemini-3-5-flash}"` in `altimate-code.json` (portable does this).
 
 Create a PAT in Databricks: **Settings → Developer → Access Tokens → Generate New Token**.
 
 **Supported workspace domains:** `*.cloud.databricks.com` (AWS), `*.azuredatabricks.net` (Azure), `*.gcp.databricks.com` (GCP).
+
+Requests go to `https://$DATABRICKS_HOST$DATABRICKS_API_BASE/chat/completions`.
 
 **Available models:**
 
@@ -356,7 +379,7 @@ Create a PAT in Databricks: **Settings → Developer → Access Tokens → Gener
 | Meta Llama | `databricks-meta-llama-3-1-405b-instruct`, `databricks-meta-llama-3-1-70b-instruct`, `databricks-meta-llama-3-1-8b-instruct` |
 | Anthropic via Databricks | `databricks-claude-sonnet-4-6`, `databricks-claude-opus-4-6` |
 | OpenAI via Databricks | `databricks-gpt-5-4`, `databricks-gpt-5-mini` |
-| Google via Databricks | `databricks-gemini-3-1-pro` |
+| Google via Databricks | `databricks-gemini-3-1-pro`, plus any catalog id from `ALTIMATE_MODEL=databricks/<id>` (e.g. `system.ai.gemini-3-5-flash`) |
 | Databricks native | `databricks-dbrx-instruct` |
 | Mistral (tool calls unsupported) | `databricks-mixtral-8x7b-instruct` |
 
