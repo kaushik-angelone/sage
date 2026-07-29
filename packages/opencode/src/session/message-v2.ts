@@ -38,8 +38,8 @@ export namespace MessageV2 {
    * found signature onto `google` so multi-step Gemini tool loops work.
    */
   export function withGoogleThoughtSignature(
-    metadata: Record<string, unknown> | undefined,
-  ): Record<string, unknown> | undefined {
+    metadata: Record<string, any> | undefined,
+  ): Record<string, any> | undefined {
     if (!metadata || typeof metadata !== "object") return metadata
     const google = metadata.google
     if (

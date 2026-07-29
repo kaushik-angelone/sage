@@ -294,7 +294,7 @@ describe("sanitizeGeminiToolParameters", () => {
 
 describe("ensureGeminiThoughtSignatures", () => {
   test("injects skip token when tool_calls lack thought_signature", () => {
-    const messages = [
+    const messages: any[] = [
       { role: "user", content: "hi" },
       {
         role: "assistant",
@@ -307,7 +307,7 @@ describe("ensureGeminiThoughtSignatures", () => {
   })
 
   test("preserves Databricks top-level thoughtSignature and mirrors to extra_content", () => {
-    const messages = [
+    const messages: any[] = [
       {
         role: "assistant",
         tool_calls: [
