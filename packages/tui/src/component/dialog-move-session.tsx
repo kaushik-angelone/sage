@@ -20,7 +20,20 @@ import type { ProjectDirectories } from "@opencode-ai/sdk/v2"
 import { useRoute } from "../context/route"
 
 export type MoveSessionSelection = { type: "directory"; directory: string; subdirectory: boolean } | { type: "new" }
-type ProjectDirectory = ProjectDirectories[number]
+// Derived from the SDK type, but written out explicitly: when this file is
+// typechecked under the opencode project config, the imported `ProjectDirectories`
+// generic collapses to `{}`, degrading every downstream `.filter`/`.find`/spread
+// to `any`/error. The local shape keeps types intact under both configs and is
+// asserted against the SDK type below so it can't silently drift.
+type ProjectDirectory = { directory: string; strategy?: string }
+// Compile-time guard: errors here if the SDK element shape ever diverges.
+type _AssertProjectDirectory = ProjectDirectories[number] extends ProjectDirectory
+  ? ProjectDirectory extends ProjectDirectories[number]
+    ? true
+    : never
+  : never
+const _assertProjectDirectory: _AssertProjectDirectory = true
+void _assertProjectDirectory
 
 type DialogMoveSessionProps = {
   projectID: string
@@ -90,11 +103,18 @@ export function DialogMoveSession(props: DialogMoveSessionProps) {
         // An initial load with no data surfaces the inline error view below. A
         // failed refresh intentionally stays quiet and keeps the already-shown
         // list interactive; reopening the dialog retries the load.
-        return info.value
+        // `info.value` is the resource's previous value; the SDK's resource
+        // typings collapse it to `unknown` under the opencode project config, so
+        // anchor it to the declared fetcher return type.
+        return info.value as ProjectDirectory[] | undefined
       }
     },
   )
-  const directoryData = createMemo(() => directories() ?? props.initialDirectories)
+  // Anchored explicitly: the `createResource` accessor's type degrades to `{}`
+  // under the opencode project config, which would cascade into every consumer.
+  const directoryData = createMemo<ProjectDirectory[] | undefined>(
+    () => (directories() as ProjectDirectory[] | undefined) ?? props.initialDirectories,
+  )
   // Show the locked error view only when we have nothing to display. A refresh
   // that fails after the list rendered keeps the list and its actions.
   const showError = createMemo(() => Boolean(loadError()) && !directoryData())
@@ -323,27 +343,27 @@ export function DialogMoveSession(props: DialogMoveSessionProps) {
           showError()
             ? []
             : [
-                {
-                  command: "dialog.move_session.new",
-                  title: "new",
-                  onTrigger: () => props.onSelect({ type: "new" }),
+              {
+                command: "dialog.move_session.new",
+                title: "new",
+                onTrigger: () => props.onSelect({ type: "new" }),
+              },
+              {
+                command: "dialog.move_session.delete",
+                title: "delete",
+                disabled: (option) => {
+                  const value = option?.value
+                  if (!value || value.type !== "directory" || value.subdirectory) return true
+                  return !directoryData()?.find((item) => item.directory === value.directory)?.strategy
                 },
-                {
-                  command: "dialog.move_session.delete",
-                  title: "delete",
-                  disabled: (option) => {
-                    const value = option?.value
-                    if (!value || value.type !== "directory" || value.subdirectory) return true
-                    return !directoryData()?.find((item) => item.directory === value.directory)?.strategy
-                  },
-                  onTrigger: remove,
-                },
-                {
-                  command: "dialog.move_session.refresh",
-                  title: "refresh",
-                  onTrigger: () => void refetch(),
-                },
-              ]
+                onTrigger: remove,
+              },
+              {
+                command: "dialog.move_session.refresh",
+                title: "refresh",
+                onTrigger: () => void refetch(),
+              },
+            ]
         }
       />
     </box>
