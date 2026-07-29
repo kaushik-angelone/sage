@@ -287,16 +287,17 @@ function renderSqlRecap(steps: SqlStep[]) {
   let title = "Final SQL"
   if (final.failed) title += " — failed"
 
-  let out = `\n\n---\n\n**${title}**\n\n\`\`\`sql\n${final.query}\n\`\`\`\n`
-  if (final.reason) out += `\n**Why:** ${final.reason}\n`
+  let inner = `\`\`\`sql\n${final.query}\n\`\`\``
+  if (final.reason) inner += `\n\n**Why:** ${final.reason}`
   if (earlier.length > 0) {
-    out += `\n**Earlier queries (${earlier.length})**\n\n`
+    inner += `\n\n**Earlier queries (${earlier.length})**\n\n`
     earlier.forEach((step, index) => {
       const reason = (step.reason || "no reason recorded") + (step.failed ? " (failed)" : "")
-      out += `${index + 1}. ${reason} — \`${oneLine(step.query)}\`\n`
+      inner += `${index + 1}. ${reason} — \`${oneLine(step.query)}\`\n`
     })
   }
-  return out
+
+  return `\n\n<details>\n<summary>${title}</summary>\n\n${inner}\n</details>\n`
 }
 // altimate_change end
 
@@ -498,6 +499,7 @@ function consumeSession(input: {
         if (err.data && typeof err.data === "object" && "message" in err.data) message = String(err.data.message)
       }
       onError(message)
+      resolveDone()
       return
     }
 

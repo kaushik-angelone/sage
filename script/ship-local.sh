@@ -47,8 +47,6 @@ case "$ARCH" in
   x86_64)        ARCH="x64" ;;
 esac
 
-<<<<<<< HEAD
-BINARY="$PKG_DIR/dist/@altimateai/altimate-code-${OS}-${ARCH}/bin/altimate"
 SNAPSHOT="$PKG_DIR/src/provider/models-snapshot.ts"
 MODELS_URL="${OPENCODE_MODELS_URL:-https://models.dev}/api.json"
 TMP_MODELS=""
@@ -95,7 +93,7 @@ resolve_models_json() {
   echo "  set MODELS_DEV_API_JSON=/path/to/api.json to build from a local copy" >&2
   return 1
 }
-=======
+
 # Indices must match allTargets order in packages/opencode/script/build.ts
 #   0 linux-arm64 | 1 linux-x64 | 2 linux-x64-baseline
 #   3 darwin-arm64 | 4 darwin-x64 | 5 darwin-x64-baseline
@@ -120,7 +118,6 @@ fi
 
 HOST_BINARY="$PKG_DIR/dist/@altimateai/altimate-code-${OS}-${ARCH}/bin/altimate"
 LINUX_BINARY="$PKG_DIR/dist/@altimateai/altimate-code-linux-x64/bin/altimate"
->>>>>>> abcf0bd7781fce6333719335d89afb95b03c4a2b
 
 codesign_macos() {
   local path=$1
@@ -137,12 +134,8 @@ codesign_macos() {
 }
 
 if [ "$SKIP_BUILD" = false ]; then
-<<<<<<< HEAD
   resolve_models_json
-  echo "Building single-platform binary…"
-=======
   echo "Building binaries for target-index=${TARGET_INDEX} (host + linux-x64)…"
->>>>>>> abcf0bd7781fce6333719335d89afb95b03c4a2b
   (
     cd "$PKG_DIR"
     export PATH="${HOME}/.bun/bin:${PATH}"
