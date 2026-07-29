@@ -26,7 +26,10 @@ const paths = {
   },
   data,
   bin: path.join(cache, "bin"),
-  log: path.join(data, "log"),
+  // Portable / multi-instance: ALTIMATE_LOG_DIR (or OPENCODE_LOG_DIR) overrides
+  // the default <$XDG_DATA_HOME>/altimate-code/log so each install can keep
+  // logs inside its own folder (e.g. portable_altimate/logs).
+  log: process.env["ALTIMATE_LOG_DIR"] || process.env["OPENCODE_LOG_DIR"] || path.join(data, "log"),
   repos: path.join(data, "repos"),
   cache,
   config,

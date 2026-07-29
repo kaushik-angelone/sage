@@ -7,6 +7,7 @@
  * Uses an exporter pattern so trace data can be sent to multiple backends:
  *   - FileExporter:  writes JSON to ~/.local/share/altimate-code/traces/ (default)
  *   - HttpExporter:  POSTs trace JSON to a remote endpoint (config-driven)
+ *   - LangfuseExporter: auto-enabled when LANGFUSE_* env vars are set
  *   - Any custom TraceExporter implementation
  *
  * Configuration (altimate-code.json / opencode.json):
@@ -14,6 +15,10 @@
  *   tracing.dir        — custom directory for trace files
  *   tracing.maxFiles   — max trace files to keep (default: 100, 0 = unlimited)
  *   tracing.exporters  — additional HTTP exporters [{name, endpoint, headers}]
+ *
+ * Langfuse (env, same as data-agent):
+ *   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+ *   DISABLE_LANGFUSE = 1|true|yes|on → off
  */
 
 import fs from "fs/promises"
@@ -22,6 +27,7 @@ import path from "path"
 import { Global } from "../../global"
 import { randomUUIDv7 } from "bun"
 import { Log } from "@/altimate/util/log"
+import { appendLangfuseExporter } from "./langfuse"
 
 // ---------------------------------------------------------------------------
 // Trace data types — v2 schema
@@ -113,6 +119,11 @@ export interface TraceFile {
     version?: string
     /** Arbitrary tags for filtering. */
     tags?: string[]
+    /**
+     * Open WebUI advertised model id (ALTIMATE_OWUI_MODEL), e.g. altimate-builder.
+     * Distinct from `model` which may hold the underlying LLM id after enrich.
+     */
+    owuiModel?: string
   }
 
   // --- Spans ---
@@ -165,6 +176,12 @@ export interface TraceExporter {
   // endpoints (e.g. HttpExporter) don't need to implement it.
   markCrashed?(sessionId: string): void
   // altimate_change end
+  /**
+   * When true, `Trace.exportRemotes()` (called on session idle) will push the
+   * current in-progress TraceFile to this exporter. FileExporter leaves this
+   * unset — it already snapshots to disk on every span.
+   */
+  readonly live?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -540,13 +557,16 @@ export class Trace {
 
   /**
    * Create a trace with the default local file exporter.
+   * Also attaches Langfuse when LANGFUSE_* env is configured.
    */
   static create(extraExporters: TraceExporter[] = []): Trace {
-    return new Trace([new FileExporter(), ...extraExporters])
+    return new Trace(appendLangfuseExporter([new FileExporter(), ...extraExporters]))
   }
 
   /**
    * Create a trace with explicit exporters (no defaults).
+   * Callers that want Langfuse should pass it via appendLangfuseExporter
+   * (Trace.create / TraceConsumer.loadConfig / run do this).
    */
   static withExporters(exporters: TraceExporter[], options?: TracerOptions): Trace {
     if (options?.maxFiles != null) {
@@ -718,14 +738,39 @@ export class Trace {
   /**
    * Enrich the trace with model/provider info from the first assistant message.
    * Called when the message.updated event fires with assistant role.
+   * Does not overwrite `metadata.owuiModel` (advertised OWUI model id).
    */
   enrichFromAssistant(info: { modelID?: string; providerID?: string; agent?: string; variant?: string }) {
     try {
       if (!info) return
       if (info.modelID) this.metadata.model = `${info.providerID ?? ""}/${info.modelID}`
       if (info.providerID) this.metadata.providerId = info.providerID
-      if (info.agent) this.metadata.agent = info.agent
+      // Prefer OWUI/agent env over assistant payload when already set (portable builder/analyst).
+      if (info.agent && !this.metadata.agent) this.metadata.agent = info.agent
       if (info.variant) this.metadata.variant = info.variant
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Apply Open WebUI bridge context (user email, advertised model id, agent).
+   * Safe to call repeatedly; preserves existing title/prompt.
+   */
+  applyOwuiContext(input: { userId?: string; modelId?: string; agent?: string }) {
+    try {
+      if (input.userId) this.metadata.userId = input.userId
+      if (input.agent) this.metadata.agent = input.agent
+      if (input.modelId) {
+        this.metadata.owuiModel = input.modelId
+        const tags = new Set(this.metadata.tags ?? [])
+        tags.add(input.modelId)
+        if (input.agent) tags.add(input.agent)
+        this.metadata.tags = [...tags]
+        // Surface OWUI model as primary model until/alongside LLM enrich.
+        if (!this.metadata.model) this.metadata.model = input.modelId
+      }
+      this.snapshot()
     } catch {
       // best-effort
     }
@@ -1168,6 +1213,32 @@ export class Trace {
       await new Promise<void>((r) => queueMicrotask(r))
     }
     // altimate_change end
+  }
+
+  /**
+   * Push the current in-progress trace to exporters with `live: true`
+   * (e.g. Langfuse) without finalizing the local Trace. Used on session
+   * idle so long-lived serve/OWUI sessions show up in Langfuse each turn
+   * instead of only on process shutdown.
+   */
+  async exportRemotes(): Promise<void> {
+    if (this.endTraceStarted || this.crashed) return
+    const live = this.exporters.filter((e) => e.live)
+    if (live.length === 0) return
+    const trace = this.buildTraceFile()
+    this.enrichSummary(trace)
+    const EXPORTER_TIMEOUT_MS = 5_000
+    await Promise.allSettled(
+      live.map((e) => {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const timeout = new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), EXPORTER_TIMEOUT_MS)
+        })
+        return Promise.race([Promise.resolve(e.export(trace)).catch(() => undefined), timeout]).finally(() => {
+          if (timer) clearTimeout(timer)
+        })
+      }),
+    )
   }
 
   /**

@@ -172,11 +172,16 @@ if (targetsFlag) {
   }
 }
 
-// --target-index=N builds a single target by index (for parallel CI matrix)
+// --target-index=N[,M,...] builds one or more targets by index (CI matrix / ship-local)
 const targetIndexFlag = process.argv.find(a => a.startsWith('--target-index='))?.split('=')[1]
 
 const targets = targetIndexFlag !== undefined
-  ? [allTargets[parseInt(targetIndexFlag, 10)]].filter(Boolean)
+  ? targetIndexFlag
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => allTargets[parseInt(s, 10)])
+      .filter(Boolean)
   : singleFlag
   ? allTargets.filter((item) => {
       if (item.os !== process.platform || item.arch !== process.arch) {
@@ -212,7 +217,7 @@ const targets = targetIndexFlag !== undefined
 //     load, and dies later with a cryptic linker error.
 if (targets.length === 0) {
   const reason = targetIndexFlag !== undefined
-    ? `--target-index=${targetIndexFlag} is out of range (allTargets has ${allTargets.length} entries — musl/win32-arm64 were removed).`
+    ? `--target-index=${targetIndexFlag} selected no valid entries (allTargets has ${allTargets.length} entries — musl/win32-arm64 were removed).`
     : singleFlag
       ? `--single found no entry in allTargets matching ${process.platform}/${process.arch} (host may be excluded — see allTargets at the top of build.ts).`
       : targetsFlag

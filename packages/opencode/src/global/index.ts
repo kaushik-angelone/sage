@@ -21,7 +21,9 @@ export namespace Global {
     },
     data,
     bin: path.join(data, "bin"),
-    log: path.join(data, "log"),
+    // Portable / multi-instance: ALTIMATE_LOG_DIR (or OPENCODE_LOG_DIR) overrides
+    // the default <$XDG_DATA_HOME>/altimate-code/log.
+    log: process.env["ALTIMATE_LOG_DIR"] || process.env["OPENCODE_LOG_DIR"] || path.join(data, "log"),
     cache,
     config,
     state,

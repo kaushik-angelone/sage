@@ -80,7 +80,11 @@ export function DialogMoveSession(props: DialogMoveSessionProps) {
         )
         const directories = await sdk.client.project.directories({ projectID }, { throwOnError: true })
         setLoadError(undefined)
-        return directories.data ?? []
+        // The generated SDK's `throwOnError: true` overload does not narrow
+        // `.data` to the 200 body when this file is typechecked under the
+        // opencode project config (it collapses to `{}`), so anchor it to the
+        // declared response type. Isolated tui builds infer this correctly.
+        return (directories.data as ProjectDirectory[] | undefined) ?? []
       } catch (error) {
         setLoadError(error)
         // An initial load with no data surfaces the inline error view below. A
