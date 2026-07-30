@@ -2,6 +2,7 @@ import { describe, expect, test, beforeAll, afterAll } from "bun:test"
 import * as Dispatcher from "../../src/altimate/native/dispatcher"
 import {
   hasSchemaInput,
+  relationKeyAliases,
   relaxValidationWithoutSchema,
   resolveSchema,
   schemaOrEmpty,
@@ -107,6 +108,30 @@ describe("Schema Resolution", () => {
     expect(schema!.columnNames("customers")).toContain("customer_id")
     expect(schema!.columnNames("customers")).toContain("email")
     expect(schema!.columnNames("orders")).toContain("amount")
+  })
+
+  test("relationKeyAliases decodes catalog__schema__table and keeps Salesforce suffixes", () => {
+    const aliases = relationKeyAliases(
+      "uc_dataorg_prod__raw_ispacescorecard__ispc_master_scard_partyinfobrokdaywise",
+    )
+    expect(aliases).toContain(
+      "uc_dataorg_prod.raw_ispacescorecard.ispc_master_scard_partyinfobrokdaywise",
+    )
+    expect(aliases).toContain("raw_ispacescorecard.ispc_master_scard_partyinfobrokdaywise")
+    expect(aliases).toContain("ispc_master_scard_partyinfobrokdaywise")
+    // Literal platform names must not be rewritten into dotted form.
+    expect(relationKeyAliases("ageing__c")).toEqual(["ageing__c"])
+  })
+
+  test("resolveSchema registers dotted aliases for __-encoded UC keys", () => {
+    const key = "uc_dataorg_prod__raw_ispacescorecard__ispc_master_scard_partyinfobrokdaywise"
+    const schema = resolveSchema(undefined, { [key]: { date: "DATE", netbrok_total: "FLOAT" } })
+    expect(schema).not.toBeNull()
+    const tables = schema!.tableNames()
+    expect(tables).toContain(key)
+    expect(tables).toContain(
+      "uc_dataorg_prod.raw_ispacescorecard.ispc_master_scard_partyinfobrokdaywise",
+    )
   })
 
   test("resolveSchema from array-of-columns format (lineage_check style)", () => {
@@ -279,6 +304,22 @@ describe("Method Wrappers", () => {
     expect(result).toHaveProperty("data")
     expect(typeof result.success).toBe("boolean")
     expect(typeof result.data).toBe("object")
+  })
+
+  test("validate accepts __-encoded schema keys for dotted SQL refs", async () => {
+    // Agents invent catalog__schema__table JSON keys; SQL keeps dotted FQNs.
+    const result = await Dispatcher.call("altimate_core.validate", {
+      sql: "SELECT date, sum(netbrok_total) as total_revenue FROM uc_dataorg_prod.raw_ispacescorecard.ispc_master_scard_partyinfobrokdaywise GROUP BY 1 ORDER BY 1 DESC LIMIT 6",
+      schema_context: {
+        uc_dataorg_prod__raw_ispacescorecard__ispc_master_scard_partyinfobrokdaywise: {
+          date: "DATE",
+          netbrok_total: "FLOAT",
+        },
+      },
+    })
+    expect(result.success).toBe(true)
+    expect((result.data as any)?.valid).toBe(true)
+    expect((result.data as any)?.errors ?? []).toEqual([])
   })
 
   test("lint returns AltimateCoreResult", async () => {

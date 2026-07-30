@@ -5,7 +5,7 @@ import { Tool } from "../../tool/tool"
 import { Global } from "../../global"
 import { Dispatcher } from "../native"
 import { classifyAndCheck } from "./sql-classify"
-import { buildPlotlyHtml, prepareEmbedHtml } from "../plot/plotly-html"
+import { buildPlotlyHtml, PLOT_KINDS, prepareEmbedHtml } from "../plot/plotly-html"
 
 function slugTitle(title: string): string {
   const slug = title
@@ -66,15 +66,37 @@ export const PlotDataframeTool = Tool.define("plot_dataframe", {
       .array(z.record(z.string(), z.unknown()))
       .optional()
       .describe("Row objects to plot when not using sql (e.g. JSON from sql_execute)"),
-    x: z.string().describe("Column name for the x-axis (or pie labels / histogram values)"),
-    y: z.string().describe("Column name for the y-axis (or pie values). For hist, may match x"),
+    x: z
+      .string()
+      .describe(
+        "Column for x-axis / pie-donut-treemap labels / funnel stages / hist values / sankey source",
+      ),
+    y: z
+      .string()
+      .describe(
+        "Column for y-axis / pie-donut-treemap-funnel values / sankey target. For hist, may match x",
+      ),
     kind: z
-      .enum(["bar", "line", "scatter", "hist", "pie", "box", "violin", "area"])
+      .enum(PLOT_KINDS as unknown as [string, ...string[]])
       .optional()
       .default("bar")
-      .describe('Chart type: "bar" | "line" | "scatter" | "hist" | "pie" | "box" | "violin" | "area"'),
+      .describe(
+        `Chart type: ${PLOT_KINDS.map((k) => `"${k}"`).join(" | ")}. ` +
+          "Aliases: histogram→hist, doughnut→donut, barh→hbar, density→heatmap.",
+      ),
     title: z.string().optional().describe("Chart title"),
-    hue: z.string().optional().describe("Optional column for color grouping / multi-series"),
+    hue: z
+      .string()
+      .optional()
+      .describe(
+        "Optional column for color grouping / multi-series (or heatmap/sankey values if z omitted)",
+      ),
+    z: z
+      .string()
+      .optional()
+      .describe(
+        "Optional value column for heatmap color or sankey link weight (preferred over hue)",
+      ),
   }),
   async execute(args, ctx) {
     try {
@@ -110,6 +132,7 @@ export const PlotDataframeTool = Tool.define("plot_dataframe", {
         kind: args.kind,
         title: args.title,
         hue: args.hue,
+        z: args.z,
       })
       const embed = prepareEmbedHtml(html)
 

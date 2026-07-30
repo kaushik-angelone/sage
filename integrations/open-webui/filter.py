@@ -17,7 +17,10 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
                                       so headings/lists don't glue mid-line.
   * reasoning deltas              -> forwarded as `delta.reasoning_content` for
                                       Open WebUI's native Thought collapsible.
-  * Rich UI Embed tool call       -> chart HTML emitted as Open WebUI `embeds`.
+  * Rich UI Embed tool call       -> chart HTML emitted as Open WebUI `embeds`,
+                                      re-sent cumulatively per turn so multiple
+                                      charts all stay visible (see
+                                      _emit_rich_ui_embeds).
   * Execution Complete tool call  -> "✅ Complete in Xs" done status pill
                                       (preferred; survives OWUI stripping custom
                                       choice fields). Backup: stream_complete /
@@ -253,6 +256,7 @@ class Filter:
             "started_at": time.monotonic(),
             "complete_emitted": False,
             "prev_ends_with_full_stop": False,
+            "embeds": [],
         }
 
     def _turn(self, key: str) -> dict:
@@ -321,26 +325,36 @@ class Filter:
             }
         )
 
-    async def _emit_rich_ui_embeds(self, args: dict, __event_emitter__) -> bool:
-        """Emit chart HTML via Rich UI embeds. Return True if handled (drop chunk)."""
+    async def _emit_rich_ui_embeds(self, turn: dict, args: dict, __event_emitter__) -> bool:
+        """Emit chart HTML via Rich UI embeds. Return True if handled (drop chunk).
+
+        Open WebUI's two halves disagree about `data.replace`: the frontend does
+        an unconditional `message.embeds = data.embeds`, while the backend
+        appends unless `replace` is true. Sending one chart per event therefore
+        rendered only the newest chart live, but persisted all of them, so the
+        rest appeared on reload. Re-sending every chart for the turn with
+        `replace: True` matches both halves — the frontend's replace shows the
+        whole set, and the backend's replace keeps the DB from stacking copies.
+        """
         embeds = args.get("embeds") or []
         if not isinstance(embeds, list) or not embeds or __event_emitter__ is None:
             return True
-        cleaned = []
         for item in embeds:
             if item is None:
                 continue
             html = str(item).strip()
             if not html:
                 continue
-            cleaned.append(_ensure_iframe_height_script(html))
-        if cleaned:
+            html = _ensure_iframe_height_script(html)
+            if html not in turn["embeds"]:
+                turn["embeds"].append(html)
+        if turn["embeds"]:
             await __event_emitter__(
                 {
                     "type": "embeds",
                     "data": {
-                        "embeds": cleaned,
-                        "replace": False,
+                        "embeds": list(turn["embeds"]),
+                        "replace": True,
                     },
                 }
             )
@@ -497,7 +511,7 @@ class Filter:
                 # Silent chart delivery (mirrors data-agent Rich UI Embed path).
                 if tool_name == "Rich UI Embed":
                     await self._emit_rich_ui_embeds(
-                        args if isinstance(args, dict) else {}, __event_emitter__
+                        turn, args if isinstance(args, dict) else {}, __event_emitter__
                     )
                     return None
                 # Preferred completion signal — content-based so it works even

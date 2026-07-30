@@ -9,7 +9,12 @@ export const AltimateCoreValidateTool = Tool.define("altimate_core_validate", {
   parameters: z.object({
     sql: z.string().describe("SQL query to validate"),
     schema_path: z.string().optional().describe("Path to YAML/JSON schema file"),
-    schema_context: z.record(z.string(), z.any()).optional().describe("Inline schema definition"),
+    schema_context: z
+      .record(z.string(), z.any())
+      .optional()
+      .describe(
+        'Inline schema as a table map. Keys must match SQL table refs — use dotted names for qualified tables (e.g. "catalog.schema.table": { "col": "TYPE" }), not catalog__schema__table.',
+      ),
   }),
   async execute(args, _ctx) {
     const hasSchema = !!(args.schema_path || (args.schema_context && Object.keys(args.schema_context).length > 0))
@@ -85,7 +90,7 @@ function classifyValidationError(message: string): string {
 const NO_SCHEMA_NOTE =
   "Note: No schema was provided, so table/column existence checks were skipped. " +
   "To catch missing tables or columns, run `schema_inspect` on the referenced tables first " +
-  'or pass `schema_context` inline as a table map, for example `{ users: { id: "INTEGER", email: "VARCHAR" } }`.'
+  'or pass `schema_context` inline as a table map, for example `{ "catalog.schema.users": { id: "INTEGER", email: "VARCHAR" } }`.'
 
 function formatValidate(data: Record<string, any>, hasSchema: boolean): string {
   if (data.error) return `Error: ${data.error}`

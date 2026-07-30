@@ -18,6 +18,65 @@
 
 import { Schema } from "@altimateai/altimate-core"
 
+/** Salesforce / platform suffixes that use `__` literally — not FQN encoding. */
+const LITERAL_DOUBLE_UNDERSCORE_SUFFIX = /__(?:c|r|s|pc|mdt|x)$/i
+
+/**
+ * Expand a relation key into every lookup form the Rust validator may need.
+ *
+ * Agents often pass Unity Catalog names with `__` instead of `.`
+ * (`catalog__schema__table`). The engine matches SQL refs by exact dotted
+ * form, so we also register the dotted decoding plus suffix aliases
+ * (`schema.table`, bare) — same idea as `buildReviewSchemaContext`.
+ *
+ * The original key is always kept so literal names like `ageing__c` still hit.
+ */
+export function relationKeyAliases(key: string): string[] {
+  if (!key) return []
+  const aliases = new Set<string>([key])
+
+  let dotted = key
+  if (!key.includes(".") && !LITERAL_DOUBLE_UNDERSCORE_SUFFIX.test(key)) {
+    const parts = key.split("__").filter((p) => p.length > 0)
+    // Require 2–3 segments, each long enough to reject `foo__c` → ["foo","c"].
+    if ((parts.length === 2 || parts.length === 3) && parts.every((p) => p.length >= 2)) {
+      dotted = parts.join(".")
+      aliases.add(dotted)
+    }
+  }
+
+  const segments = dotted.split(".").filter((p) => p.length > 0)
+  if (segments.length >= 2) {
+    aliases.add(segments.join("."))
+    aliases.add(segments[segments.length - 1]!)
+    if (segments.length >= 3) {
+      aliases.add(`${segments[segments.length - 2]}.${segments[segments.length - 1]}`)
+    }
+  }
+  return [...aliases]
+}
+
+function registerTableAliases(
+  tables: Record<string, any>,
+  key: string,
+  record: Record<string, any>,
+): void {
+  for (const alias of relationKeyAliases(key)) {
+    // First writer wins — avoid silently replacing a different table that
+    // already claimed a shared bare / schema.table alias.
+    if (tables[alias] === undefined) tables[alias] = record
+  }
+}
+
+function expandTableKeys(tables: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {}
+  for (const [name, def] of Object.entries(tables)) {
+    if (def === null || def === undefined) continue
+    registerTableAliases(out, name, def)
+  }
+  return out
+}
+
 /**
  * Detect whether a schema_context object is in flat format or SchemaDefinition format.
  *
@@ -59,12 +118,12 @@ function flatToSchemaDefinition(flat: Record<string, any>): Record<string, any> 
         name: c.name,
         type: c.type ?? c.data_type ?? "VARCHAR",
       }))
-      tables[tableName] = { columns }
+      registerTableAliases(tables, tableName, { columns })
     } else if (typeof colsOrDef === "object") {
       // Variant 3: already has a `columns` array
       if (Array.isArray(colsOrDef.columns)) {
         if (colsOrDef.columns.length === 0) continue // skip empty tables
-        tables[tableName] = colsOrDef
+        registerTableAliases(tables, tableName, colsOrDef)
       } else {
         // Variant 1: flat map { "col_name": "TYPE", ... }
         const entries = Object.entries(colsOrDef)
@@ -73,7 +132,7 @@ function flatToSchemaDefinition(flat: Record<string, any>): Record<string, any> 
           name: colName,
           type: String(colType),
         }))
-        tables[tableName] = { columns }
+        registerTableAliases(tables, tableName, { columns })
       }
     }
   }
@@ -86,7 +145,7 @@ function flatToSchemaDefinition(flat: Record<string, any>): Record<string, any> 
  */
 function normalizeSchemaContext(ctx: Record<string, any>): string {
   if (isSchemaDefinitionFormat(ctx)) {
-    return JSON.stringify(ctx)
+    return JSON.stringify({ ...ctx, tables: expandTableKeys(ctx.tables) })
   }
   return JSON.stringify(flatToSchemaDefinition(ctx))
 }

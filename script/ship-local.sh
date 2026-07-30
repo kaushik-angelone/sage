@@ -6,9 +6,12 @@
 #   ./script/ship-local.sh
 #   ./script/ship-local.sh --skip-build   # reinstall / sync existing dist only
 #   PORTABLE_DIR=/path/to/portable_altimate ./script/ship-local.sh
+#   SKIP_S3=1 ./script/ship-local.sh     # skip S3 upload + stamp write
 #
 # MODELS_DEV_API_JSON=/path/to/api.json   build against a local models.dev copy
 #                                         instead of fetching it.
+# After sync, uploads bin/altimate-linux-x64 to S3 and writes
+# portable bin/altimate-linux-x64.s3-stamp (override with SKIP_S3=1).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -181,8 +184,8 @@ fi
 if [ -n "${PORTABLE_DIR:-}" ] && [ -d "$PORTABLE_DIR" ]; then
   echo "Syncing binaries → $PORTABLE_DIR/bin …"
   mkdir -p "$PORTABLE_DIR/bin"
-  # Linux ELF for remote deploy (tracked). Do not copy bare bin/altimate —
-  # run.sh uses altimate-linux-x64 / altimate-darwin-* only.
+  # Linux ELF for remote deploy (gitignored; shipped via S3 + stamp file).
+  # Do not copy bare bin/altimate — run.sh uses altimate-linux-x64 / altimate-darwin-* only.
   cp "$LINUX_BINARY" "$PORTABLE_DIR/bin/altimate-linux-x64"
   chmod +x "$PORTABLE_DIR/bin/altimate-linux-x64"
   rm -f "$PORTABLE_DIR/bin/altimate"
@@ -192,10 +195,17 @@ if [ -n "${PORTABLE_DIR:-}" ] && [ -d "$PORTABLE_DIR" ]; then
     cp "$HOST_BINARY" "$PORTABLE_DIR/bin/$MAC_NAME"
     chmod +x "$PORTABLE_DIR/bin/$MAC_NAME"
     codesign_macos "$PORTABLE_DIR/bin/$MAC_NAME"
-    echo "  portable: bin/altimate-linux-x64  (push)"
+    echo "  portable: bin/altimate-linux-x64  (gitignored; S3)"
     echo "  portable: bin/$MAC_NAME  (local only, gitignored)"
   else
-    echo "  portable: bin/altimate-linux-x64  (push)"
+    echo "  portable: bin/altimate-linux-x64  (gitignored; S3)"
+  fi
+  # Stage Linux binary on S3 + write stamp for remote pull-bin-s3.sh
+  if [ "${SKIP_S3:-}" != "1" ] && [ -x "$PORTABLE_DIR/scripts/push-bin-s3.sh" ]; then
+    echo "Uploading Linux binary to S3…"
+    "$PORTABLE_DIR/scripts/push-bin-s3.sh" "$PORTABLE_DIR/bin/altimate-linux-x64"
+  elif [ "${SKIP_S3:-}" = "1" ]; then
+    echo "note: SKIP_S3=1 — skipped S3 upload"
   fi
 else
   echo "note: portable bundle not found (set PORTABLE_DIR to sync binaries)"
