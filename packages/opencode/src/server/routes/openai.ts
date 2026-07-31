@@ -22,6 +22,11 @@
 //                              requests with reply "once"; anything else rejects.
 //   ALTIMATE_OWUI_SESSION_MAP  Optional path for chat→session persistence
 //                              (default: <$XDG_DATA_HOME>/altimate-code/owui-chat-sessions.json).
+//   ALTIMATE_OWUI_SLASH_GROUP_IDS
+//                              Comma-separated Open WebUI group ids (or names)
+//                              allowed to use /model and /think. Empty = all
+//                              builder users. Matched against body.user_groups /
+//                              user_group_ids or X-OpenWebUI-User-Group-Ids.
 import { Hono } from "hono"
 import { streamSSE } from "hono/streaming"
 import { lazy } from "../../util/lazy"
@@ -43,7 +48,17 @@ import {
   getMappedSession,
   setMappedSession,
 } from "./owui-session-map"
+import { clearSessionOverride, getSessionOverride } from "./owui-session-overrides"
+import {
+  BUILDER_SLASH_DENIAL,
+  collectOwuiGroupIds,
+  formatGroupSlashDenial,
+  isBuilderAgent,
+  isSlashGroupAllowed,
+  parseOwuiSlashCommand,
+} from "./owui-slash"
 import { setOwuiTraceContext } from "./owui-trace-context"
+import { ModelID, ProviderID } from "../../provider/schema"
 
 const log = Log.create({ service: "openai-bridge" })
 
@@ -124,11 +139,19 @@ async function resolveSession(chatKey: string, firstMessage: string): Promise<Se
     const still = await Session.get(existing).catch(() => undefined)
     if (still) return existing
     deleteMappedSession(chatKey)
+    clearSessionOverride(existing)
   }
   const title = firstMessage ? firstMessage.slice(0, 80) : "Open WebUI chat"
   const session = await Session.create({ title })
   setMappedSession(chatKey, session.id)
   return session.id
+}
+
+function assistantTextFromCommand(result: { parts: Array<{ type: string; text?: string }> }): string {
+  return result.parts
+    .filter((p): p is { type: "text"; text: string } => p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("")
 }
 
 type EmitKind = "text" | "reasoning" | "tool_call" | "tool_done"
@@ -671,10 +694,128 @@ export const OpenAIRoutes = lazy(() =>
       }
       // altimate_change end
 
-      const firePrompt = () =>
-        SessionPrompt.prompt({
+      // altimate_change start — builder-only /model and /think (no LLM turn)
+      const slash = parseOwuiSlashCommand(userMessage)
+      if (slash) {
+        let text: string
+        try {
+          if (!isBuilderAgent(agent)) {
+            text =
+              `${BUILDER_SLASH_DENIAL}\n\n` +
+              `This serve process has \`ALTIMATE_OWUI_AGENT=${agent || "(unset)"}\`. ` +
+              `Set it to \`builder\` and restart.`
+          } else {
+            const headerNames: string[] = []
+            try {
+              // hono RawRequest may expose headers via entries
+              const raw = (c.req.raw as Request | undefined)?.headers
+              if (raw) for (const [k] of raw.entries()) headerNames.push(k)
+            } catch {
+              // ignore
+            }
+            const groups = collectOwuiGroupIds({
+              body: body && typeof body === "object" ? (body as Record<string, unknown>) : undefined,
+              header: (name) => c.req.header(name),
+              headerNames,
+            })
+            log.info("owui slash gate", {
+              command: slash.command,
+              agent,
+              groups,
+              allowlistSet: Boolean(process.env["ALTIMATE_OWUI_SLASH_GROUP_IDS"]?.trim()),
+              bodyKeys: body && typeof body === "object" ? Object.keys(body) : [],
+              groupHeaders: headerNames.filter((n) => /group/i.test(n)),
+            })
+            if (!isSlashGroupAllowed(groups)) {
+              text = formatGroupSlashDenial({ received: groups })
+            } else {
+              const result = await SessionPrompt.command({
+                sessionID,
+                agent: "builder",
+                command: slash.command,
+                arguments: slash.arguments,
+              })
+              text = assistantTextFromCommand(result) || "Done."
+            }
+          }
+        } catch (err) {
+          text = `**Error:** ${err instanceof Error ? err.message : String(err)}`
+          log.error("slash command failed", { sessionID, command: slash.command, error: text })
+        }
+
+        if (!wantStream) {
+          return c.json({
+            id: completionID,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: text },
+                finish_reason: "stop",
+              },
+            ],
+          })
+        }
+
+        c.header("Cache-Control", "no-cache")
+        c.header("Connection", "keep-alive")
+        c.header("X-Accel-Buffering", "no")
+        const startedAtSlash = Date.now()
+        return streamSSE(c, async (stream) => {
+          const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
+          await write(
+            chunk({
+              id: completionID,
+              model,
+              author: "assistant",
+              messageType: "text",
+              delta: { role: "assistant" },
+            }),
+          )
+          if (text) {
+            await write(
+              chunk({
+                id: completionID,
+                model,
+                author: "assistant",
+                messageType: "text",
+                delta: { content: text },
+              }),
+            )
+          }
+          const durationSlash = (Date.now() - startedAtSlash) / 1000
+          await write(executionCompleteChunk({ id: completionID, model, durationSec: durationSlash }))
+          await write(
+            chunk({
+              id: completionID,
+              model,
+              author: "assistant",
+              messageType: "text",
+              delta: {},
+              finishReason: "stop",
+              overallDuration: durationSlash,
+              streamComplete: true,
+            }),
+          )
+          await stream.writeSSE({ data: "[DONE]" })
+        })
+      }
+      // altimate_change end
+
+      const firePrompt = () => {
+        const ov = getSessionOverride(sessionID)
+        return SessionPrompt.prompt({
           sessionID,
           agent,
+          model: ov?.model
+            ? {
+                providerID: ProviderID.make(ov.model.providerID),
+                modelID: ModelID.make(ov.model.modelID),
+              }
+            : undefined,
+          variant: ov?.variant,
           parts: [{ type: "text", text: userMessage }],
         }).catch((err) => {
           log.error("prompt failed", { sessionID, error: err instanceof Error ? err.message : String(err) })
@@ -683,6 +824,7 @@ export const OpenAIRoutes = lazy(() =>
             error: new NamedError.Unknown({ message: err instanceof Error ? err.message : String(err) }).toObject(),
           }).catch(() => { })
         })
+      }
 
       if (!wantStream) {
         // Non-streaming: buffer assistant text and return a single completion.

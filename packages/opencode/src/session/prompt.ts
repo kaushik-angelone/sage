@@ -76,6 +76,18 @@ import { stampRegistryToolSource, describeMcpTool } from "../altimate/tool-sourc
 // altimate_change end
 // altimate_change end
 import { Telemetry } from "@/telemetry" // altimate_change — session telemetry
+// altimate_change start — OWUI /model /think session overrides
+import {
+  getSessionOverride,
+  setSessionOverride,
+} from "../server/routes/owui-session-overrides"
+import {
+  BUILDER_SLASH_DENIAL,
+  formatRegisteredModels,
+  formatThinkStatus,
+  isBuilderAgent,
+} from "../server/routes/owui-slash"
+// altimate_change end
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -2840,42 +2852,92 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   export async function command(input: CommandInput): Promise<MessageV2.WithParts> {
     log.info("command", input)
 
-    // altimate_change start — /mcps enable/disable: direct handler bypasses LLM
-    if (input.command === "mcps") {
-
-      // Helper: build and persist an assistant reply for a command shortcut.
-      async function respond(
-        parentID: MessageID,
-        responseText: string,
-        model: { modelID: ModelID; providerID: ProviderID },
-      ): Promise<MessageV2.WithParts> {
-        const now = Date.now()
-        const assistantMsg: MessageV2.Assistant = {
-          id: MessageID.ascending(), role: "assistant", sessionID: input.sessionID,
-          parentID, modelID: model.modelID, providerID: model.providerID,
-          mode: "builder", agent: "builder",
-          path: { cwd: Instance.directory, root: Instance.worktree },
-          cost: 0, tokens: { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-          finish: "stop", time: { created: now, completed: now },
-        }
-        await Session.updateMessage(assistantMsg)
-        const textPart: MessageV2.TextPart = {
-          id: PartID.ascending(), sessionID: input.sessionID, messageID: assistantMsg.id,
-          type: "text", text: responseText, time: { start: now, end: now },
-        }
-        await Session.updatePart(textPart)
-        AppRuntime.runPromise(
-          EventV2Bridge.Service.use((events) =>
-            events.publish(Command.Event.Executed, {
-              name: input.command,
-              sessionID: input.sessionID,
-              arguments: input.arguments,
-              messageID: assistantMsg.id,
-            }),
-          ),
-        )
-        return { info: assistantMsg, parts: [textPart] } as MessageV2.WithParts
+    // altimate_change start — synthetic assistant reply for slash shortcuts (no LLM)
+    async function respond(
+      parentID: MessageID,
+      responseText: string,
+      model: { modelID: ModelID; providerID: ProviderID },
+      agentName = "builder",
+    ): Promise<MessageV2.WithParts> {
+      const now = Date.now()
+      const assistantMsg: MessageV2.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        sessionID: input.sessionID,
+        parentID,
+        modelID: model.modelID,
+        providerID: model.providerID,
+        mode: agentName,
+        agent: agentName,
+        path: { cwd: Instance.directory, root: Instance.worktree },
+        cost: 0,
+        tokens: { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        finish: "stop",
+        time: { created: now, completed: now },
       }
+      await Session.updateMessage(assistantMsg)
+      const textPart: MessageV2.TextPart = {
+        id: PartID.ascending(),
+        sessionID: input.sessionID,
+        messageID: assistantMsg.id,
+        type: "text",
+        text: responseText,
+        time: { start: now, end: now },
+      }
+      await Session.updatePart(textPart)
+      AppRuntime.runPromise(
+        EventV2Bridge.Service.use((events) =>
+          events.publish(Command.Event.Executed, {
+            name: input.command,
+            sessionID: input.sessionID,
+            arguments: input.arguments,
+            messageID: assistantMsg.id,
+          }),
+        ),
+      )
+      return { info: assistantMsg, parts: [textPart] } as MessageV2.WithParts
+    }
+
+    async function resolveCommandAgentName(): Promise<string> {
+      if (input.agent?.trim()) return input.agent.trim()
+      for await (const item of MessageV2.stream(input.sessionID)) {
+        if (item.info.role === "user" && item.info.agent) return item.info.agent
+      }
+      return await Agent.defaultAgent()
+    }
+
+    async function listRegisteredModels(): Promise<Array<{ providerID: string; modelID: string }>> {
+      const providers = await Provider.list()
+      const out: Array<{ providerID: string; modelID: string }> = []
+      for (const [providerID, provider] of Object.entries(providers)) {
+        for (const modelID of Object.keys(provider.models ?? {})) {
+          out.push({ providerID, modelID })
+        }
+      }
+      out.sort((a, b) => `${a.providerID}/${a.modelID}`.localeCompare(`${b.providerID}/${b.modelID}`))
+      return out
+    }
+
+    async function resolveEffectiveModelRef(agentName: string) {
+      const ov = getSessionOverride(input.sessionID)
+      if (ov?.model) {
+        return {
+          providerID: ProviderID.make(ov.model.providerID),
+          modelID: ModelID.make(ov.model.modelID),
+        }
+      }
+      const agent = await Agent.get(agentName)
+      if (agent?.model) {
+        return {
+          providerID: ProviderID.make(agent.model.providerID),
+          modelID: ModelID.make(agent.model.modelID),
+        }
+      }
+      return lastModel(input.sessionID)
+    }
+
+    // /mcps enable/disable: direct handler bypasses LLM
+    if (input.command === "mcps") {
       const trimmed = input.arguments.trim()
 
       if (!trimmed) {
@@ -2941,6 +3003,153 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
         return respond(userMsg.info.id, responseText, model)
       }
+    }
+
+    // /model and /think|/thinking — builder-only session overrides (OWUI + TUI)
+    const slashCmd =
+      input.command === "thinking" ? "think" : input.command === "model" || input.command === "think" ? input.command : null
+    if (slashCmd) {
+      const agentName = await resolveCommandAgentName()
+      const display = slashCmd === "model" ? "/model" : "/think"
+      const userText = input.arguments.trim() ? `${display} ${input.arguments.trim()}` : display
+      const userMsg = await createUserMessage({
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        agent: agentName,
+        parts: [{ type: "text", text: userText }],
+      })
+      const model = await lastModel(input.sessionID)
+
+      if (!isBuilderAgent(agentName)) {
+        return respond(userMsg.info.id, BUILDER_SLASH_DENIAL, model, agentName)
+      }
+
+      if (slashCmd === "model") {
+        const registered = await listRegisteredModels()
+        const arg = input.arguments.trim()
+        if (!arg) {
+          const current = await resolveEffectiveModelRef(agentName)
+          return respond(
+            userMsg.info.id,
+            formatRegisteredModels(registered, current),
+            model,
+            agentName,
+          )
+        }
+
+        let providerID: string
+        let modelID: string
+        if (arg.includes("/")) {
+          const parsed = Provider.parseModel(arg)
+          providerID = parsed.providerID
+          modelID = parsed.modelID
+        } else {
+          const matches = registered.filter((m) => m.modelID === arg)
+          if (matches.length === 0) {
+            return respond(
+              userMsg.info.id,
+              `Unknown model \`${arg}\`. Run \`/model\` to list registered models.`,
+              model,
+              agentName,
+            )
+          }
+          if (matches.length > 1) {
+            const opts = matches.map((m) => `\`${m.providerID}/${m.modelID}\``).join(", ")
+            return respond(
+              userMsg.info.id,
+              `Model id \`${arg}\` is ambiguous. Specify provider/model: ${opts}.`,
+              model,
+              agentName,
+            )
+          }
+          providerID = matches[0]!.providerID
+          modelID = matches[0]!.modelID
+        }
+
+        const found = registered.find((m) => m.providerID === providerID && m.modelID === modelID)
+        if (!found) {
+          return respond(
+            userMsg.info.id,
+            `Unknown model \`${providerID}/${modelID}\`. Run \`/model\` to list registered models.`,
+            model,
+            agentName,
+          )
+        }
+
+        try {
+          await Provider.getModel(ProviderID.make(providerID), ModelID.make(modelID))
+        } catch {
+          return respond(
+            userMsg.info.id,
+            `Unknown model \`${providerID}/${modelID}\`. Run \`/model\` to list registered models.`,
+            model,
+            agentName,
+          )
+        }
+
+        setSessionOverride(input.sessionID, { model: { providerID, modelID } })
+        return respond(
+          userMsg.info.id,
+          `Model set to \`${providerID}/${modelID}\` for this chat.`,
+          model,
+          agentName,
+        )
+      }
+
+      // /think
+      const effective = await resolveEffectiveModelRef(agentName)
+      let full: Provider.Model | undefined
+      try {
+        full = await Provider.getModel(effective.providerID, effective.modelID)
+      } catch {
+        return respond(
+          userMsg.info.id,
+          `Could not load model \`${effective.providerID}/${effective.modelID}\` to list thinking levels.`,
+          model,
+          agentName,
+        )
+      }
+      const available = Object.keys(full.variants ?? {}).sort()
+      const modelLabel = `${effective.providerID}/${effective.modelID}`
+      const ov = getSessionOverride(input.sessionID)
+      const currentVariant = ov?.variant
+      const arg = input.arguments.trim().toLowerCase()
+
+      if (!arg) {
+        return respond(
+          userMsg.info.id,
+          formatThinkStatus({ modelLabel, current: currentVariant, available }),
+          model,
+          agentName,
+        )
+      }
+
+      if (arg === "off" || arg === "none" || arg === "default") {
+        setSessionOverride(input.sessionID, { clearVariant: true })
+        return respond(userMsg.info.id, `Thinking cleared for \`${modelLabel}\` (using default).`, model, agentName)
+      }
+
+      if (available.length === 0) {
+        return respond(
+          userMsg.info.id,
+          `Model \`${modelLabel}\` has no thinking/reasoning variants.`,
+          model,
+          agentName,
+        )
+      }
+
+      const match = available.find((v) => v.toLowerCase() === arg)
+      if (!match) {
+        return respond(
+          userMsg.info.id,
+          `Unknown thinking level \`${input.arguments.trim()}\`. Available: ${available.map((v) => `\`${v}\``).join(", ")}, or \`off\`.`,
+          model,
+          agentName,
+        )
+      }
+
+      setSessionOverride(input.sessionID, { variant: match })
+      return respond(userMsg.info.id, `Thinking set to \`${match}\` for \`${modelLabel}\`.`, model, agentName)
     }
     // altimate_change end
 

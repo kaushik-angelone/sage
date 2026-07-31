@@ -430,6 +430,26 @@ class Filter:
         key = self._turn_key(__metadata__)
         self._turns.pop(key, None)
         self._turn(key)
+        # OWUI 0.10.x does not forward group membership on OpenAI proxy requests
+        # (no {{USER_GROUP_IDS}} header template). Inject ids + names so the
+        # altimate bridge can enforce ALTIMATE_OWUI_SLASH_GROUP_IDS.
+        try:
+            from open_webui.models.groups import Groups
+
+            uid = (__user__ or {}).get("id")
+            if uid:
+                groups = Groups.get_groups_by_member_id(uid)
+                if hasattr(groups, "__await__"):
+                    groups = await groups
+                groups = groups or []
+                body["user_groups"] = [
+                    g.name for g in groups if getattr(g, "name", None)
+                ]
+                body["user_group_ids"] = [
+                    str(g.id) for g in groups if getattr(g, "id", None) is not None
+                ]
+        except Exception:
+            pass
         return body
 
     @staticmethod

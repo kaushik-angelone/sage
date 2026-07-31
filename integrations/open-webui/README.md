@@ -51,6 +51,38 @@ The `altimate-code` model should now appear in the model picker.
 > `/v1/models` and Langfuse tags distinguish builder vs analyst (e.g.
 > `altimate-builder` + `builder`).
 
+### Builder slash commands (`/model`, `/think`)
+
+In **builder** mode only (`ALTIMATE_OWUI_AGENT=builder`), you can change the
+session model and thinking/reasoning variant mid-chat without using Open WebUI’s
+model dropdown (that dropdown stays the display id from `ALTIMATE_OWUI_MODEL`):
+
+```
+/model
+/model databricks/system.ai.gemini-3-5-flash
+/think
+/think high
+/think off
+```
+
+`/thinking` is an alias for `/think`. Bare `/model` lists registered providers;
+bare `/think` lists variants for the active model. Overrides apply to every
+following turn in that chat (in-memory for the serve process lifetime). Analyst
+and other agents get a short denial if these commands are used.
+
+**Group access:** set `ALTIMATE_OWUI_SLASH_GROUP_IDS` in the portable `.env` to a
+comma-separated list of Open WebUI group ids (or names) that may use these
+commands. Leave the env unset to allow all builder users.
+
+Open WebUI 0.10.x does **not** put group membership on the upstream OpenAI
+request by itself (`ENABLE_FORWARD_USER_INFO_HEADERS` only sends name/id/email/role).
+The filter’s `inlet` injects `body.user_groups` (names) and `body.user_group_ids`
+so the bridge can match the allowlist. Requirements:
+
+1. This filter is enabled and attached to the Altimate model (or set **Global**).
+2. The user is a member of an allowlisted OWUI group (Admin → Users → Groups).
+3. Restart `serve` after changing `ALTIMATE_OWUI_SLASH_GROUP_IDS`.
+
 ## 3. Install the filter
 
 Admin Panel -> Functions -> **+** -> paste the contents of [`filter.py`](./filter.py),
