@@ -186,6 +186,19 @@ export function parseOwuiSlashCommand(text: string): OwuiSlashCommand | undefine
   return { command, arguments: (match[2] ?? "").trim() }
 }
 
+/** Short `/model` aliases → full `provider/model-id` (OWUI + TUI). */
+export const OWUI_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  pro: "google/gemini-3.1-pro-preview",
+  lite: "google/gemini-3.5-flash-lite",
+}
+
+/** Expand `pro` / `lite` (case-insensitive); leave other args unchanged. */
+export function resolveOwuiModelArg(arg: string): string {
+  const trimmed = (arg || "").trim()
+  if (!trimmed) return trimmed
+  return OWUI_MODEL_ALIASES[trimmed.toLowerCase()] ?? trimmed
+}
+
 export function isBuilderAgent(agent: string | undefined | null): boolean {
   return (agent || "").trim().toLowerCase() === "builder"
 }
@@ -209,7 +222,14 @@ export function formatRegisteredModels(
       return id === currentKey ? `- \`${id}\` ← current` : `- \`${id}\``
     })
     .join("\n")
-  return `Registered models:\n\n${lines}\n\nSet with \`/model provider/model-id\`.`
+  const aliases = Object.entries(OWUI_MODEL_ALIASES)
+    .map(([k, v]) => `\`${k}\` → \`${v}\``)
+    .join(", ")
+  return (
+    `Registered models:\n\n${lines}\n\n` +
+    `Set with \`/model provider/model-id\`.\n` +
+    `Aliases: ${aliases}.`
+  )
 }
 
 export function formatThinkStatus(input: {

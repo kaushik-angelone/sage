@@ -59,16 +59,20 @@ model dropdown (that dropdown stays the display id from `ALTIMATE_OWUI_MODEL`):
 
 ```
 /model
+/model pro
+/model lite
 /model databricks/system.ai.gemini-3-5-flash
 /think
 /think high
 /think off
 ```
 
-`/thinking` is an alias for `/think`. Bare `/model` lists registered providers;
-bare `/think` lists variants for the active model. Overrides apply to every
-following turn in that chat (in-memory for the serve process lifetime). Analyst
-and other agents get a short denial if these commands are used.
+`/thinking` is an alias for `/think`. Model shortcuts: `pro` →
+`google/gemini-3.1-pro-preview`, `lite` → `google/gemini-3.5-flash-lite`.
+Bare `/model` lists registered providers; bare `/think` lists variants for the
+active model. Overrides apply to every following turn in that chat (in-memory
+for the serve process lifetime). Analyst and other agents get a short denial if
+these commands are used.
 
 **Group access:** set `ALTIMATE_OWUI_SLASH_GROUP_IDS` in the portable `.env` to a
 comma-separated list of Open WebUI group ids (or names) that may use these
@@ -98,7 +102,7 @@ save, enable it, and attach it to the `altimate-code` model (or make it global).
 | Execution Complete (`args.duration`) | Emits a "✅ Complete in Xs" done pill (preferred path). |
 | reasoning (`delta.reasoning_content`) | Forwarded for Open WebUI’s native Thought collapsible. |
 | plain text | Forwarded; if a chunk starts with a markdown block marker (`#`, `-`, `*`, …) and the previous chunk ended with a full stop (`.`), a newline is prefixed. |
-| completion sentinel (`stream_complete` / `finish_reason: stop`) | Backup for the Complete pill if the tool-call signal was missed. Final SQL is streamed as ordinary text just before completion. |
+| completion sentinel (`stream_complete` / `finish_reason: stop`) | Backup for the Complete pill if the tool-call signal was missed. Executed Queries is streamed as ordinary text just before completion. |
 | error | Emits a "❌ Error occurred." pill. |
 
 ### Plotting in chat
@@ -117,26 +121,25 @@ depend on Open WebUI forwarding the custom `message_type` field.
 Tool labels and argument previews live in `TOOL_LABELS` / `ARG_PREVIEW` at the top
 of `filter.py` — edit those to taste.
 
-### SQL rationale and the final SQL
+### SQL rationale and Executed Queries
 
 `sql_execute` takes an optional `reason` — one sentence from the agent explaining
 why that query is being run. The builder and analyst prompts instruct the agent
-to always pass it. The filter uses it in two places:
+to always pass it. The filter / bridge use it in two places:
 
 - **Per step** — the status pill reads `🧮 Executing SQL | Find the latest month
   with complete F&O data` instead of a truncated statement, so the step list
   reads as the agent's plan rather than a wall of SQL.
-- **End of turn** — the bridge streams a `Final SQL` section as ordinary
+- **End of turn** — the bridge streams an `Executed Queries` section as ordinary
   assistant text just before the completion sentinel. That puts it in the same
   stream Open WebUI uses to build the saved message body (filter-side message
-  events get wiped when the body is rebuilt). The section shows the last query
-  that succeeded, the warehouse it ran against, its rationale, and a one-line
-  recap of the earlier queries (failed ones marked).
+  events get wiped when the body is rebuilt). Nested under that heading is one
+  `<details>` block per executed query: the summary is the SQL `reason`, and the
+  body has the statement plus the first 10 result rows (failed queries are marked
+  and omit rows).
 
-Queries that failed are excluded from `Final SQL`; if every query failed, the last
-attempt is shown and the heading says so. Failure detection uses the tool's
-result metadata on the bridge. A missing `reason` degrades to a statement
-preview in the pill and no `Why:` line.
+A missing `reason` degrades to a statement preview in the pill and as the details
+summary.
 
 ### Turn state and the completion pill
 

@@ -86,6 +86,7 @@ import {
   formatRegisteredModels,
   formatThinkStatus,
   isBuilderAgent,
+  resolveOwuiModelArg,
 } from "../server/routes/owui-slash"
 // altimate_change end
 
@@ -3026,7 +3027,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       if (slashCmd === "model") {
         const registered = await listRegisteredModels()
-        const arg = input.arguments.trim()
+        const arg = resolveOwuiModelArg(input.arguments.trim())
         if (!arg) {
           const current = await resolveEffectiveModelRef(agentName)
           return respond(

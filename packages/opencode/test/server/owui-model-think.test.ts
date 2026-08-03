@@ -16,6 +16,8 @@ import {
   isSlashGroupAllowed,
   parseOwuiSlashCommand,
   parseSlashGroupAllowlist,
+  resolveOwuiModelArg,
+  OWUI_MODEL_ALIASES,
 } from "../../src/server/routes/owui-slash"
 
 describe("OWUI /model and /think slash helpers", () => {
@@ -25,6 +27,17 @@ describe("OWUI /model and /think slash helpers", () => {
       command: "model",
       arguments: "databricks/system.ai.gemini-3-5-flash",
     })
+  })
+
+  test("resolves /model pro and lite aliases", () => {
+    expect(resolveOwuiModelArg("pro")).toBe("google/gemini-3.1-pro-preview")
+    expect(resolveOwuiModelArg("PRO")).toBe("google/gemini-3.1-pro-preview")
+    expect(resolveOwuiModelArg("lite")).toBe("google/gemini-3.5-flash-lite")
+    expect(resolveOwuiModelArg("Lite")).toBe("google/gemini-3.5-flash-lite")
+    expect(resolveOwuiModelArg("google/gemini-3.1-pro-preview")).toBe("google/gemini-3.1-pro-preview")
+    expect(resolveOwuiModelArg("")).toBe("")
+    expect(OWUI_MODEL_ALIASES.pro).toBe("google/gemini-3.1-pro-preview")
+    expect(OWUI_MODEL_ALIASES.lite).toBe("google/gemini-3.5-flash-lite")
   })
 
   test("parses /think and /thinking alias", () => {
@@ -102,6 +115,8 @@ describe("OWUI /model and /think slash helpers", () => {
     )
     expect(text).toContain("`databricks/a`")
     expect(text).toContain("`databricks/b` ← current")
+    expect(text).toContain("`pro` → `google/gemini-3.1-pro-preview`")
+    expect(text).toContain("`lite` → `google/gemini-3.5-flash-lite`")
   })
 
   test("formatThinkStatus lists levels", () => {
