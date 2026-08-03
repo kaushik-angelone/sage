@@ -71,7 +71,7 @@ model dropdown (that dropdown stays the display id from `ALTIMATE_OWUI_MODEL`):
 
 `/thinking` is an alias for `/think`. Model shortcuts: `pro` →
 `google/gemini-3.1-pro-preview`, `lite` → `google/gemini-3.5-flash-lite`,
-`flash` → `google/gemini-3.6-flash`, `flite` → `google/gemini-3.6-flash-lite`.
+`flash` → `google/gemini-3.6-flash`, `flite` → `google/gemini-3.5-flash-lite`.
 Bare `/model` lists registered providers; bare `/think` lists variants for the
 active model. Overrides apply to every following turn in that chat (in-memory
 for the serve process lifetime). Analyst and other agents get a short denial if

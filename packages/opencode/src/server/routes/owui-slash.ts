@@ -191,7 +191,7 @@ export const OWUI_MODEL_ALIASES: Readonly<Record<string, string>> = {
   pro: "google/gemini-3.1-pro-preview",
   lite: "google/gemini-3.5-flash-lite",
   flash: "google/gemini-3.6-flash",
-  flite: "google/gemini-3.6-flash-lite",
+  flite: "google/gemini-3.5-flash-lite",
 }
 
 /** Expand `pro` / `lite` (case-insensitive); leave other args unchanged. */

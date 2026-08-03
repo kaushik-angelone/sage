@@ -36,14 +36,14 @@ describe("OWUI /model and /think slash helpers", () => {
     expect(resolveOwuiModelArg("Lite")).toBe("google/gemini-3.5-flash-lite")
     expect(resolveOwuiModelArg("flash")).toBe("google/gemini-3.6-flash")
     expect(resolveOwuiModelArg("FLASH")).toBe("google/gemini-3.6-flash")
-    expect(resolveOwuiModelArg("flite")).toBe("google/gemini-3.6-flash-lite")
-    expect(resolveOwuiModelArg("FLite")).toBe("google/gemini-3.6-flash-lite")
+    expect(resolveOwuiModelArg("flite")).toBe("google/gemini-3.5-flash-lite")
+    expect(resolveOwuiModelArg("FLite")).toBe("google/gemini-3.5-flash-lite")
     expect(resolveOwuiModelArg("google/gemini-3.1-pro-preview")).toBe("google/gemini-3.1-pro-preview")
     expect(resolveOwuiModelArg("")).toBe("")
     expect(OWUI_MODEL_ALIASES.pro).toBe("google/gemini-3.1-pro-preview")
     expect(OWUI_MODEL_ALIASES.lite).toBe("google/gemini-3.5-flash-lite")
     expect(OWUI_MODEL_ALIASES.flash).toBe("google/gemini-3.6-flash")
-    expect(OWUI_MODEL_ALIASES.flite).toBe("google/gemini-3.6-flash-lite")
+    expect(OWUI_MODEL_ALIASES.flite).toBe("google/gemini-3.5-flash-lite")
   })
 
   test("parses /think and /thinking alias", () => {
@@ -124,7 +124,7 @@ describe("OWUI /model and /think slash helpers", () => {
     expect(text).toContain("`pro` → `google/gemini-3.1-pro-preview`")
     expect(text).toContain("`lite` → `google/gemini-3.5-flash-lite`")
     expect(text).toContain("`flash` → `google/gemini-3.6-flash`")
-    expect(text).toContain("`flite` → `google/gemini-3.6-flash-lite`")
+    expect(text).toContain("`flite` → `google/gemini-3.5-flash-lite`")
   })
 
   test("formatThinkStatus lists levels", () => {
