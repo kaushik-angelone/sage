@@ -25,8 +25,8 @@ for the `altimate-code` model. It turns the raw streaming chunks emitted by
                                       (preferred; survives OWUI stripping custom
                                       choice fields). Backup: stream_complete /
                                       finish_reason stop / outlet fallback.
-                                      Final SQL is streamed by the bridge as
-                                      ordinary text before this signal.
+                                      Executed Queries is streamed by the bridge
+                                      as ordinary text before this signal.
   * `message_type: "error"`       -> an error status pill.
 
 The bridge chunk contract (see packages/opencode/src/server/routes/openai.ts):

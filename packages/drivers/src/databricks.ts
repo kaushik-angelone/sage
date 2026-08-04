@@ -31,10 +31,20 @@ export async function connect(config: ConnectionConfig): Promise<Connector> {
       // Use a no-op logger that satisfies the interface but discards all output.
       const logger = { log: () => {}, setLevel: () => {} }
       client = new DBSQLClient({ logger })
+      // Prefer canonical fields; fall back to common aliases in case a caller
+      // skipped normalizeConfig().
+      const host = (config.server_hostname ?? config.host) as string | undefined
+      const path = (config.http_path ?? config.httpPath) as string | undefined
+      const token = (config.access_token ?? config.token) as string | undefined
+      if (!host || !path || !token) {
+        throw new Error(
+          "Databricks connection requires server_hostname (or host), http_path, and access_token (or token).",
+        )
+      }
       const connectionOptions: Record<string, unknown> = {
-        host: config.server_hostname,
-        path: config.http_path,
-        token: config.access_token,
+        host,
+        path,
+        token,
       }
 
       await client.connect(connectionOptions)

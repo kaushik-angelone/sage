@@ -36,6 +36,9 @@ async function rowsFromSql(sql: string, warehouse: string | undefined, limit: nu
     warehouse,
     limit,
   })
+  if (result.error) {
+    throw new Error(`SQL failed: ${result.error}`)
+  }
   if (!result.rows?.length) {
     throw new Error("SQL returned 0 rows — nothing to plot")
   }

@@ -208,9 +208,12 @@ interface SqlStep {
   warehouse?: string
   reason?: string
   failed: boolean
+  /** Markdown table (or short note) of the first rows from the tool output. */
+  preview?: string
 }
 
 const SQL_TOOLS = new Set(["sql_execute"])
+const SQL_PREVIEW_ROWS = 10
 
 function oneLine(value: string, limit = 70) {
   const text = value.split(/\s+/).filter(Boolean).join(" ")
@@ -228,8 +231,8 @@ function sqlStepFromInput(input: unknown): SqlStep | undefined {
 }
 
 // Tool-call chunks go through the OWUI filter as JSON in delta.content. Shipping
-// the full SQL there is unnecessary (Final SQL is streamed at end-of-turn) and
-// can break the filter when a large statement is truncated mid-SSE — the pill
+// the full SQL there is unnecessary (Executed Queries is streamed at end-of-turn)
+// and can break the filter when a large statement is truncated mid-SSE — the pill
 // then silently disappears. Keep the status payload small and self-describing.
 function extractEmbeds(metadata: unknown): string[] {
   if (!metadata || typeof metadata !== "object") return []
@@ -265,54 +268,75 @@ function argsForOwui(tool: string, input: unknown): Record<string, unknown> {
   }
 }
 
-// Distinguish the query that produced the answer from trailing exploration.
-//
-// "Last successful execution" is a bad proxy for "the query behind the table":
-// agents routinely run a cheap probe AFTER the real aggregation (e.g.
-// `SELECT DISTINCT category, type` to sanity-check labels), and that probe would
-// otherwise be surfaced as the Final SQL. We instead score each successful step
-// by how much it looks like a result-producing query and pick the best one,
-// breaking ties toward the later query. Falls back to last-executed when nothing
-// scores (e.g. every query is a plain SELECT), preserving the old behavior.
-function looksExploratory(query: string): boolean {
-  const q = query.trim().toLowerCase()
-  // Schema/metadata probes are never the answer query.
-  if (/^\s*(show|describe|desc|explain|use)\b/.test(q)) return true
-  // `SELECT DISTINCT <cols>` with no aggregation is a label/enumeration probe.
-  if (/^\s*select\s+distinct\b/.test(q) && !/\bgroup\s+by\b/.test(q)) return true
-  return false
+function escapeMdCell(value: unknown): string {
+  if (value === null || value === undefined) return "NULL"
+  return String(value).replace(/\|/g, "\\|").replace(/\r?\n/g, " ")
 }
 
-function resultQueryScore(step: SqlStep): number {
-  const q = step.query.toLowerCase()
-  let score = 0
-  if (/\bgroup\s+by\b/.test(q)) score += 3
-  if (/\b(sum|count|avg|min|max|median|percentile|approx_count_distinct)\s*\(/.test(q)) score += 2
-  if (/\bwith\b[\s\S]*\bas\s*\(/.test(q)) score += 1 // CTE — usually the composed answer
-  if (/\border\s+by\b/.test(q)) score += 1
-  if (/\bjoin\b/.test(q)) score += 1
-  if (looksExploratory(step.query)) score -= 5
-  // Longer statements tend to be the composed answer, not a probe. Kept small so
-  // it only breaks ties between otherwise-similar queries.
-  score += Math.min(2, Math.floor(step.query.length / 200))
-  return score
+/** Build a markdown table from row objects (first `limit` rows). */
+function formatRecordsTable(records: Record<string, unknown>[], limit = SQL_PREVIEW_ROWS): string {
+  if (records.length === 0) return "_(0 rows)_"
+  const slice = records.slice(0, limit)
+  const columns = Object.keys(slice[0] ?? {})
+  if (columns.length === 0) return `_(${records.length} rows)_`
+  const header = `| ${columns.join(" | ")} |`
+  const sep = `| ${columns.map(() => "---").join(" | ")} |`
+  const body = slice.map((row) => `| ${columns.map((c) => escapeMdCell(row[c])).join(" | ")} |`)
+  let out = [header, sep, ...body].join("\n")
+  if (records.length > limit) out += `\n\n_(showing first ${limit} of ${records.length} rows)_`
+  return out
 }
 
-function pickFinalStep(steps: SqlStep[]): SqlStep {
-  const ok = steps.filter((step) => !step.failed)
-  const candidates = ok.length > 0 ? ok : steps
-  // Highest score wins; on a tie, the later query wins (reduceRight-style: iterate
-  // forward and use `>` so the last max is kept).
-  let best = candidates[0]
-  let bestScore = resultQueryScore(best)
-  for (let i = 1; i < candidates.length; i++) {
-    const s = resultQueryScore(candidates[i])
-    if (s >= bestScore) {
-      best = candidates[i]
-      bestScore = s
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+/**
+ * Pull the first N result rows from sql_execute tool output.
+ * Prefers the trailing ```json records block; falls back to the ASCII table.
+ */
+function rowsPreviewFromOutput(output: unknown): string | undefined {
+  if (typeof output !== "string" || !output.trim()) return undefined
+  const text = output.trim()
+  if (text === "(0 rows)" || /^\(0 rows\)/.test(text)) return "_(0 rows)_"
+
+  const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/)
+  if (jsonMatch?.[1]) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]) as unknown
+      if (Array.isArray(parsed) && parsed.every((row) => row && typeof row === "object" && !Array.isArray(row))) {
+        return formatRecordsTable(parsed as Record<string, unknown>[])
+      }
+    } catch {
+      // fall through to ASCII table
     }
   }
-  return best
+
+  const lines = text.split("\n")
+  const headerIdx = lines.findIndex((line, i) => i + 1 < lines.length && /-\+-/.test(lines[i + 1] ?? ""))
+  if (headerIdx < 0) return undefined
+  const header = lines[headerIdx] ?? ""
+  const data: string[] = []
+  for (let i = headerIdx + 2; i < lines.length && data.length < SQL_PREVIEW_ROWS; i++) {
+    const line = lines[i] ?? ""
+    if (!line.trim() || /^\(\d+\s+rows?\)/.test(line.trim()) || line.startsWith("```")) break
+    data.push(line)
+  }
+  if (data.length === 0) return "_(0 rows)_"
+  const columns = header.split(" | ").map((c) => c.trim())
+  const mdHeader = `| ${columns.join(" | ")} |`
+  const mdSep = `| ${columns.map(() => "---").join(" | ")} |`
+  const mdRows = data.map((line) => {
+    const cells = line.split(" | ")
+    return `| ${columns.map((_, i) => escapeMdCell(cells[i] ?? "")).join(" | ")} |`
+  })
+  let out = [mdHeader, mdSep, ...mdRows].join("\n")
+  const countMatch = text.match(/\((\d+)\s+rows?\)/)
+  const total = countMatch ? Number(countMatch[1]) : undefined
+  if (total !== undefined && total > data.length) {
+    out += `\n\n_(showing first ${data.length} of ${total} rows)_`
+  }
+  return out
 }
 
 // The recap is streamed as ordinary assistant text rather than pushed by the
@@ -320,23 +344,22 @@ function pickFinalStep(steps: SqlStep[]): SqlStep {
 // deltas, so anything injected out-of-band is dropped when the turn is saved.
 function renderSqlRecap(steps: SqlStep[]) {
   if (steps.length === 0) return ""
-  const final = pickFinalStep(steps)
-  const earlier = steps.filter((step) => step !== final)
 
-  let title = "Final SQL"
-  if (final.failed) title += " — failed"
+  const blocks = steps.map((step, index) => {
+    const summary = escapeHtml(
+      (step.reason || oneLine(step.query) || `Query ${index + 1}`) + (step.failed ? " (failed)" : ""),
+    )
+    let body = `\`\`\`sql\n${step.query}\n\`\`\``
+    if (step.warehouse) body += `\n\n**Warehouse:** \`${step.warehouse}\``
+    if (step.failed) {
+      body += "\n\n_Query failed — no result rows._"
+    } else if (step.preview) {
+      body += `\n\n${step.preview}`
+    }
+    return `<details>\n<summary>${summary}</summary>\n\n${body}\n</details>`
+  })
 
-  let inner = `\`\`\`sql\n${final.query}\n\`\`\``
-  if (final.reason) inner += `\n\n**Why:** ${final.reason}`
-  if (earlier.length > 0) {
-    inner += `\n\n**Earlier queries (${earlier.length})**\n\n`
-    earlier.forEach((step, index) => {
-      const reason = (step.reason || "no reason recorded") + (step.failed ? " (failed)" : "")
-      inner += `${index + 1}. ${reason} — \`${oneLine(step.query)}\`\n`
-    })
-  }
-
-  return `\n\n<details>\n<summary>${title}</summary>\n\n${inner}\n</details>\n`
+  return `\n\n<details>\n<summary>Executed Queries</summary>\n\n${blocks.join("\n\n")}\n</details>\n`
 }
 // altimate_change end
 
@@ -481,9 +504,13 @@ function consumeSession(input: {
           const metadataError = state.metadata?.error
           const error =
             typeof state.error === "string" ? state.error : typeof metadataError === "string" ? metadataError : undefined
-          if (error) {
-            const step = sqlStepByCall.get(part.callID)
-            if (step) step.failed = true
+          const step = sqlStepByCall.get(part.callID)
+          if (step) {
+            if (error) step.failed = true
+            else if (state.status === "completed") {
+              const preview = rowsPreviewFromOutput(state.output)
+              if (preview) step.preview = preview
+            }
           }
           emit("tool_done", {
             name: part.tool,
@@ -967,7 +994,7 @@ export const OpenAIRoutes = lazy(() =>
           unsubscribe()
         }
 
-        // Stream the Final SQL recap as ordinary assistant text BEFORE the
+        // Stream the Executed Queries recap as ordinary assistant text BEFORE the
         // completion sentinel. Open WebUI rebuilds the saved message from
         // accumulated stream deltas / output items, so anything pushed only via
         // the filter's event emitter is wiped when the turn finishes.

@@ -61,6 +61,17 @@ export const SqlExecuteTool = Tool.define("sql_execute", {
         limit: args.limit,
       })
 
+      // sql.execute catches driver failures and returns { row_count: 0, error }
+      // instead of throwing — surface that error so callers don't see a fake
+      // "(0 rows)" success for connection/auth/SQL failures.
+      if (result.error) {
+        return {
+          title: "SQL: ERROR",
+          metadata: { rowCount: 0, truncated: false, error: result.error, reason: args.reason },
+          output: `Failed to execute SQL: ${result.error}\n\nEnsure the dispatcher is running and a warehouse connection is configured.`,
+        }
+      }
+
       let output = formatResult(result)
       // altimate_change start — emit SQL structure fingerprint telemetry
       try {
