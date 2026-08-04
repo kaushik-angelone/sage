@@ -40,6 +40,7 @@ import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
 import { ConfigMarkdown } from "../config/markdown"
 import { SessionSummary } from "./summary"
+import { Snapshot } from "@/snapshot"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { fn } from "@/util/fn"
 import { SessionProcessor } from "./processor"
@@ -546,6 +547,10 @@ export namespace SessionPrompt {
     })
     using _unsubToolsChanged = defer(unsubscribeToolsChanged)
     // altimate_change end
+    // altimate_change start — turn-scoped snapshots: one baseline before the
+    // assistant run, one patch after it ends (not per LLM step).
+    const turnSnapshot = await Snapshot.track()
+    // altimate_change end
     while (true) {
       // altimate_change start — SessionStatus.set became async in v1.4.0; await so busy state flushes before LLM call
       await SessionStatus.set(sessionID, { type: "busy" })
@@ -1010,6 +1015,10 @@ export namespace SessionPrompt {
         sessionID: sessionID,
         model,
         abort,
+        // altimate_change start — turn-scoped snapshot baseline for this loop
+        turnScoped: true,
+        turnSnapshot,
+        // altimate_change end
       })
       using _ = defer(() => InstructionPrompt.clear(processor.message.id))
 
@@ -1518,6 +1527,9 @@ export namespace SessionPrompt {
       }
       continue
     }
+    // altimate_change start — finalize turn-scoped snapshot (after assistant turn)
+    await finalizeTurnSnapshot({ sessionID, before: turnSnapshot })
+    // altimate_change end
     // altimate_change start — set idle on normal loop exit; abort path is handled by processor catch block
     if (!abort.aborted) {
       await SessionStatus.set(sessionID, { type: "idle" })
@@ -1643,6 +1655,50 @@ export namespace SessionPrompt {
     }
     throw new Error("Impossible")
   })
+
+  /** @internal Exported for testing — stamp turn patch + after-hash once the assistant loop ends. */
+  export async function finalizeTurnSnapshot(input: { sessionID: SessionID; before: string | undefined }) {
+    if (!input.before) return
+    const { sessionID, before } = input
+    try {
+      const after = await Snapshot.track()
+      const patch = await Snapshot.patch(before)
+      const msgs = MessageV2.filterCompacted(MessageV2.stream(sessionID))
+      let lastUserID: MessageID | undefined
+      let lastAssistant: MessageV2.WithParts | undefined
+      for (const msg of msgs) {
+        if (msg.info.role === "user") lastUserID = msg.info.id
+        if (msg.info.role === "assistant" && lastUserID && msg.info.parentID === lastUserID) {
+          lastAssistant = msg
+        }
+      }
+      if (!lastAssistant) return
+      if (patch.files.length) {
+        await Session.updatePart({
+          id: PartID.ascending(),
+          messageID: lastAssistant.info.id,
+          sessionID,
+          type: "patch",
+          hash: patch.hash,
+          files: patch.files,
+        })
+      }
+      if (after) {
+        const finish = [...lastAssistant.parts].reverse().find((p) => p.type === "step-finish")
+        if (finish && finish.type === "step-finish") {
+          await Session.updatePart({ ...finish, snapshot: after })
+        }
+      }
+      if (lastUserID) {
+        SessionSummary.summarize({ sessionID, messageID: lastUserID })
+      }
+    } catch (e) {
+      log.warn("turn snapshot finalize failed", {
+        sessionID,
+        error: e instanceof Error ? e.message : String(e),
+      })
+    }
+  }
 
   async function lastModel(sessionID: SessionID) {
     for await (const item of MessageV2.stream(sessionID)) {

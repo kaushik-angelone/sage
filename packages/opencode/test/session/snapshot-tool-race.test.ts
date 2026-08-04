@@ -124,9 +124,9 @@ const providerCfg = (url: string) => ({
   },
 })
 
-// BUG: REGRESSION: instant tool execution can still outrun snapshot capture; the tool completes and creates the file,
-// but SessionSummary.diff remains empty. Minimal src fix: packages/opencode/src/session/processor.ts:299-300 must
-// capture the pre-tool snapshot before provider/tool execution can mutate the worktree.
+// Turn-scoped snapshots: baseline is taken at loop start (before any LLM/tools),
+// so instant tool execution cannot outrun the before-hash. After-hash + patch are
+// finalized when the assistant turn ends.
 it.live("tool execution produces non-empty session diff (snapshot race)", () =>
   provideTmpdirServerLegacy(
     Effect.fnUntraced(function* ({ dir, llm }) {

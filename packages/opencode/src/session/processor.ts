@@ -44,12 +44,22 @@ export namespace SessionProcessor {
     sessionID: SessionID
     model: Provider.Model
     abort: AbortSignal
+    /**
+     * When true, do not call Snapshot.track/patch inside the processor.
+     * The session loop owns one baseline before the user turn and one
+     * patch after the assistant turn (see SessionPrompt.loop).
+     */
+    turnScoped?: boolean
+    /** Baseline tree hash for this user turn; stored on step-start parts. */
+    turnSnapshot?: string
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
     // altimate_change start — per-tool call counter for varied-input loop detection
     const toolCallCounts: Record<string, number> = {}
     // altimate_change end
-    let snapshot: string | undefined
+    // altimate_change start — turn-scoped snapshots: baseline comes from the loop
+    let snapshot: string | undefined = input.turnScoped ? input.turnSnapshot : undefined
+    // altimate_change end
     let blocked = false
     let attempt = 0
     let needsCompaction = false
@@ -80,9 +90,9 @@ export namespace SessionProcessor {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
-            if (snapshot === undefined) {
-              // altimate_change — upstream_fix: capture the pre-tool snapshot
-              // before the LLM stream can execute provider-side tools.
+            if (snapshot === undefined && !input.turnScoped) {
+              // Capture the pre-tool snapshot before the LLM stream can execute
+              // provider-side tools. Skipped when the loop owns turn-scoped snapshots.
               snapshot = await Snapshot.track()
             }
             const stream = await LLM.stream(streamInput)
@@ -309,7 +319,7 @@ export namespace SessionProcessor {
                   throw value.error
 
                 case "start-step":
-                  if (snapshot === undefined) snapshot = await Snapshot.track()
+                  if (snapshot === undefined && !input.turnScoped) snapshot = await Snapshot.track()
                   // altimate_change start — record step start time for generation telemetry duration
                   stepStartTime = Date.now()
                   // altimate_change end
@@ -317,7 +327,7 @@ export namespace SessionProcessor {
                     id: PartID.ascending(),
                     messageID: input.assistantMessage.id,
                     sessionID: input.sessionID,
-                    snapshot,
+                    snapshot: input.turnScoped ? input.turnSnapshot : snapshot,
                     type: "step-start",
                   })
                   break
@@ -443,7 +453,8 @@ export namespace SessionProcessor {
                   await Session.updatePart({
                     id: PartID.ascending(),
                     reason: value.finishReason,
-                    snapshot: await Snapshot.track(),
+                    // Turn-scoped: after-hash is stamped once at loop end.
+                    snapshot: input.turnScoped ? undefined : await Snapshot.track(),
                     messageID: input.assistantMessage.id,
                     sessionID: input.assistantMessage.sessionID,
                     type: "step-finish",
@@ -451,7 +462,7 @@ export namespace SessionProcessor {
                     cost: usage.cost,
                   })
                   await Session.updateMessage(input.assistantMessage)
-                  if (snapshot) {
+                  if (!input.turnScoped && snapshot) {
                     const patch = await Snapshot.patch(snapshot)
                     if (patch.files.length) {
                       await Session.updatePart({
@@ -465,10 +476,12 @@ export namespace SessionProcessor {
                     }
                     snapshot = undefined
                   }
-                  SessionSummary.summarize({
-                    sessionID: input.sessionID,
-                    messageID: input.assistantMessage.parentID,
-                  })
+                  if (!input.turnScoped) {
+                    SessionSummary.summarize({
+                      sessionID: input.sessionID,
+                      messageID: input.assistantMessage.parentID,
+                    })
+                  }
                   if (
                     !input.assistantMessage.summary &&
                     (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model }))
@@ -616,7 +629,7 @@ export namespace SessionProcessor {
               // altimate_change end
             }
           }
-          if (snapshot) {
+          if (!input.turnScoped && snapshot) {
             const patch = await Snapshot.patch(snapshot)
             if (patch.files.length) {
               await Session.updatePart({
