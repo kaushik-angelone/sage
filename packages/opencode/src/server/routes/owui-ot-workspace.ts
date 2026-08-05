@@ -36,12 +36,14 @@ function hasContextMarker(dir: string): boolean {
 }
 
 function chmodOpen(dir: string) {
-  // Keep o-rwx (no cross-user browse). Keep g+rwX so OT server/group can
-  // participate; host sage uses ACL. Do not chown here — ownership is fixed
+  // Match open-terminal multi-user: home/dirs 2770 (setgid + group rwx) so
+  // `sudo -u <user> mkdir` and server-group writes work. Do not use 750 —
+  // that blocks OT saves when host cp left deploy ownership. Chown is fixed
   // in the OT container via run-open-terminal.sh --fix-perms.
   const home = path.dirname(dir)
-  spawnSync("chmod", ["750", home], { stdio: "ignore" })
+  spawnSync("chmod", ["2770", home], { stdio: "ignore" })
   spawnSync("chmod", ["-R", "ug+rwX,o-rwx", dir], { stdio: "ignore" })
+  spawnSync("find", [dir, "-type", "d", "-exec", "chmod", "2770", "{}", "+"], { stdio: "ignore" })
   const uid = String(process.getuid?.() ?? "")
   if (uid) {
     const acl = spawnSync("setfacl", ["-m", `u:${uid}:--x`, home], { stdio: "ignore" })
@@ -52,7 +54,7 @@ function chmodOpen(dir: string) {
     }
   }
   // ponytail: no ACL — fall back so host sage can still write.
-  spawnSync("chmod", ["711", home], { stdio: "ignore" })
+  spawnSync("chmod", ["2770", home], { stdio: "ignore" })
   spawnSync("chmod", ["-R", "a+rwX", dir], { stdio: "ignore" })
 }
 
