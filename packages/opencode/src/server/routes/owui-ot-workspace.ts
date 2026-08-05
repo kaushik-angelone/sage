@@ -1,25 +1,30 @@
 import fs from "fs"
 import path from "path"
+import { createHash } from "crypto"
 import { spawnSync } from "child_process"
 
 /**
  * Per-user Open Terminal workspace under ALTIMATE_OWUI_OT_ROOT.
- * Each OWUI user gets `$OT_ROOT/<sanitized-id>/altimate_context` (a copy of the
- * seed). Host altimate_context is never written. Matches Open Terminal
- * multi-user homes at `/home/<username>/altimate_context`.
+ * Username sanitization MUST match open-terminal's user_isolation.sanitize_username
+ * so sage and the OT file browser open the same `/home/<user>/altimate_context`.
  */
 
 const CONTEXT_DIR = "altimate_context"
 const SKIP_HOMES = new Set(["_skel", "altimate-agent"])
 
-/** Best-effort Linux username sanitize (Open Terminal multi-user / useradd). */
-export function sanitizeOtUsername(raw: string): string {
-  let name = raw.trim().toLowerCase()
-  if (name.includes("@")) name = name.slice(0, name.indexOf("@"))
-  name = name.replace(/[^a-z0-9_-]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "")
-  if (!name) name = "anon"
-  if (!/^[a-z_]/.test(name)) name = `u_${name}`
-  return name.slice(0, 32)
+/**
+ * Match open-webui/open-terminal `sanitize_username` (user_isolation.py):
+ * alphanumeric only, first 8 chars, `u` prefix if leading digit, hash fallback.
+ */
+export function sanitizeOtUsername(raw: string, userPrefix = ""): string {
+  const cleaned = raw.trim().toLowerCase().replace(/[^a-z0-9]/g, "")
+  let name =
+    cleaned.length >= 4
+      ? cleaned.slice(0, 8)
+      : createHash("sha256").update(raw.trim()).digest("hex").slice(0, 8)
+  name = `${userPrefix}${name}`
+  if (!name || !/^[a-z_]/.test(name)) name = `u${name || "anon"}`
+  return name
 }
 
 function hasContextMarker(dir: string): boolean {
@@ -31,14 +36,24 @@ function hasContextMarker(dir: string): boolean {
 }
 
 function chmodOpen(dir: string) {
-  // ponytail: a+rwX so host sage + container OT user can both edit; upgrade = match OT uid/gid.
-  spawnSync("chmod", ["-R", "a+rwX", dir], { stdio: "ignore" })
+  // Keep home private (OT multi-user uses 700). World a+rwX + home 755 let
+  // every OT user read every other home — that leaked edits across users.
+  // Prefer ACL for the host uid so sage can write without opening o+rwx.
   const home = path.dirname(dir)
-  try {
-    fs.chmodSync(home, 0o755)
-  } catch {
-    // ignore
+  spawnSync("chmod", ["700", home], { stdio: "ignore" })
+  spawnSync("chmod", ["-R", "u+rwX,go-rwx", dir], { stdio: "ignore" })
+  const uid = String(process.getuid?.() ?? "")
+  if (uid) {
+    const acl = spawnSync("setfacl", ["-m", `u:${uid}:--x`, home], { stdio: "ignore" })
+    if (acl.status === 0) {
+      spawnSync("setfacl", ["-R", "-m", `u:${uid}:rwx`, dir], { stdio: "ignore" })
+      spawnSync("setfacl", ["-R", "-d", "-m", `u:${uid}:rwx`, dir], { stdio: "ignore" })
+      return
+    }
   }
+  // ponytail: no ACL — fall back to open perms so host sage can still write.
+  spawnSync("chmod", ["711", home], { stdio: "ignore" })
+  spawnSync("chmod", ["-R", "a+rwX", dir], { stdio: "ignore" })
 }
 
 /** Copy seed → dest (replace contents). */
@@ -56,10 +71,11 @@ export function seedOtContext(dest: string, seed: string) {
 
 /**
  * Resolve the per-user project directory, seeding from `seed` when empty.
- * If a home already exists under otRoot that matches the sanitized id, use it.
+ * Path: `$OT_ROOT/<sanitizeOtUsername(id)>/altimate_context` (= OT `/home/<user>/…`).
  */
 export function ensureOtUserProject(otRoot: string, userRaw: string, seed: string): string {
-  const user = sanitizeOtUsername(userRaw)
+  const prefix = (process.env["OPEN_TERMINAL_USER_PREFIX"] || "").trim()
+  const user = sanitizeOtUsername(userRaw, prefix)
   const home = path.join(otRoot, user)
   const dest = path.join(home, CONTEXT_DIR)
   fs.mkdirSync(home, { recursive: true })
