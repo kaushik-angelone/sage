@@ -83,10 +83,10 @@ import {
   setSessionOverride,
 } from "../server/routes/owui-session-overrides"
 import {
-  BUILDER_SLASH_DENIAL,
+  MODEL_THINK_SLASH_DENIAL,
   formatRegisteredModels,
   formatThinkStatus,
-  isBuilderAgent,
+  allowsModelThinkSlash,
   resolveOwuiModelArg,
 } from "../server/routes/owui-slash"
 // altimate_change end
@@ -3062,7 +3062,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
     }
 
-    // /model and /think|/thinking — builder-only session overrides (OWUI + TUI)
+    // /model and /think|/thinking — builder/analyst session overrides (OWUI + TUI)
     const slashCmd =
       input.command === "thinking" ? "think" : input.command === "model" || input.command === "think" ? input.command : null
     if (slashCmd) {
@@ -3077,8 +3077,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       })
       const model = await lastModel(input.sessionID)
 
-      if (!isBuilderAgent(agentName)) {
-        return respond(userMsg.info.id, BUILDER_SLASH_DENIAL, model, agentName)
+      if (!allowsModelThinkSlash(agentName)) {
+        return respond(userMsg.info.id, MODEL_THINK_SLASH_DENIAL, model, agentName)
       }
 
       if (slashCmd === "model") {

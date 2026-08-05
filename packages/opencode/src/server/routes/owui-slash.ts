@@ -1,9 +1,10 @@
 /**
- * Parse Open WebUI slash commands for builder model / thinking overrides.
+ * Parse Open WebUI slash commands for model / thinking overrides
+ * (builder and analyst).
  */
 
-export const BUILDER_SLASH_DENIAL =
-  "`/model` and `/think` are only available in builder mode."
+export const MODEL_THINK_SLASH_DENIAL =
+  "`/model` and `/think` are only available in builder or analyst mode."
 
 export const GROUP_SLASH_DENIAL =
   "`/model` and `/think` are not enabled for your Open WebUI group."
@@ -46,7 +47,7 @@ export function parseSlashGroupAllowlist(raw: string | undefined | null): string
 }
 
 /**
- * When the allowlist env is unset/empty, all builder users may use the commands.
+ * When the allowlist env is unset/empty, all builder/analyst users may use the commands.
  * When set, the caller must present at least one matching OWUI group id or name.
  */
 export function isSlashGroupAllowed(
@@ -201,8 +202,10 @@ export function resolveOwuiModelArg(arg: string): string {
   return OWUI_MODEL_ALIASES[trimmed.toLowerCase()] ?? trimmed
 }
 
-export function isBuilderAgent(agent: string | undefined | null): boolean {
-  return (agent || "").trim().toLowerCase() === "builder"
+/** `/model` and `/think` are allowed for builder and analyst serves. */
+export function allowsModelThinkSlash(agent: string | undefined | null): boolean {
+  const a = (agent || "").trim().toLowerCase()
+  return a === "builder" || a === "analyst"
 }
 
 export function formatRegisteredModels(

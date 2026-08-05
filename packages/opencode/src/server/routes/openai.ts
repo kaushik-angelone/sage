@@ -25,6 +25,8 @@
 //   ALTIMATE_OT_OWUI_MODEL     OT-mode /v1/models id when OT_ROOT set (default "altimate-ot").
 //                              Host serve never advertises this id.
 //   ALTIMATE_OWUI_AGENT        Agent to run (optional; uses the session default otherwise).
+//                              When "analyst": /plan <q> → plan agent + gemini-3.6-flash;
+//                              /execute or approval → analyst + gemini-3.5-flash-lite.
 //   ALTIMATE_OWUI_PERMISSION   "approve" (default) auto-approves tool permission
 //                              requests with reply "once"; anything else rejects.
 //   ALTIMATE_OWUI_SESSION_MAP  Optional path for chat→session persistence
@@ -32,7 +34,7 @@
 //   ALTIMATE_OWUI_SLASH_GROUP_IDS
 //                              Comma-separated Open WebUI group ids (or names)
 //                              allowed to use /model and /think. Empty = all
-//                              builder users. Matched against body.user_groups /
+//                              builder/analyst users. Matched against body.user_groups /
 //                              user_group_ids or X-OpenWebUI-User-Group-Ids.
 import { Hono } from "hono"
 import { streamSSE } from "hono/streaming"
@@ -55,15 +57,16 @@ import {
   getMappedSession,
   setMappedSession,
 } from "./owui-session-map"
-import { clearSessionOverride, getSessionOverride } from "./owui-session-overrides"
+import { clearSessionOverride, getSessionOverride, setSessionOverride } from "./owui-session-overrides"
 import {
-  BUILDER_SLASH_DENIAL,
+  MODEL_THINK_SLASH_DENIAL,
   collectOwuiGroupIds,
   formatGroupSlashDenial,
-  isBuilderAgent,
+  allowsModelThinkSlash,
   isSlashGroupAllowed,
   parseOwuiSlashCommand,
 } from "./owui-slash"
+import { resolveAnalystPlanTurn } from "./owui-analyst-plan"
 import { setOwuiTraceContext } from "./owui-trace-context"
 import { makeOwuiWriter } from "./owui-sse"
 import { ensureOtUserProject, resolveOtSeed } from "./owui-ot-workspace"
@@ -819,16 +822,16 @@ export const OpenAIRoutes = lazy(() =>
       }
       // altimate_change end
 
-      // altimate_change start — builder-only /model and /think (no LLM turn)
+      // altimate_change start — builder/analyst /model and /think (no LLM turn)
       const slash = parseOwuiSlashCommand(userMessage)
       if (slash) {
         let text: string
         try {
-          if (!isBuilderAgent(agent)) {
+          if (!allowsModelThinkSlash(agent)) {
             text =
-              `${BUILDER_SLASH_DENIAL}\n\n` +
+              `${MODEL_THINK_SLASH_DENIAL}\n\n` +
               `This serve process has \`ALTIMATE_OWUI_AGENT=${agent || "(unset)"}\`. ` +
-              `Set it to \`builder\` and restart.`
+              `Set it to \`builder\` or \`analyst\` and restart.`
           } else {
             const headerNames: string[] = []
             try {
@@ -856,7 +859,7 @@ export const OpenAIRoutes = lazy(() =>
             } else {
               const result = await SessionPrompt.command({
                 sessionID,
-                agent: "builder",
+                agent: agent!,
                 command: slash.command,
                 arguments: slash.arguments,
               })
@@ -932,11 +935,80 @@ export const OpenAIRoutes = lazy(() =>
       }
       // altimate_change end
 
+      // altimate_change start — analyst explicit /plan → plan@flash, /execute → analyst@flite
+      let promptAgent = agent
+      let promptText = userMessage
+      let phaseStatus: string | undefined
+      const planTurn = resolveAnalystPlanTurn({
+        agent,
+        userMessage,
+        phase: getSessionOverride(sessionID)?.phase,
+      })
+      if (planTurn.kind === "help") {
+        const help = planTurn.text
+        if (!wantStream) {
+          return c.json({
+            id: completionID,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, message: { role: "assistant", content: help }, finish_reason: "stop" }],
+          })
+        }
+        c.header("Cache-Control", "no-cache")
+        c.header("Connection", "keep-alive")
+        c.header("X-Accel-Buffering", "no")
+        const startedHelp = Date.now()
+        return streamSSE(c, async (stream) => {
+          const { write, flush } = makeOwuiWriter(stream, {
+            warn: (msg, data) => log.warn(msg, data),
+          })
+          await write(chunk({ id: completionID, model, author: "assistant", messageType: "text", delta: { role: "assistant" } }))
+          await write(chunk({ id: completionID, model, author: "assistant", messageType: "text", delta: { content: help } }))
+          const dur = (Date.now() - startedHelp) / 1000
+          await write(executionCompleteChunk({ id: completionID, model, durationSec: dur }))
+          await write(
+            chunk({
+              id: completionID,
+              model,
+              author: "assistant",
+              messageType: "text",
+              delta: {},
+              finishReason: "stop",
+              overallDuration: dur,
+              streamComplete: true,
+            }),
+          )
+          await flush()
+          await stream.writeSSE({ data: "[DONE]" })
+        })
+      }
+      if (planTurn.kind === "prompt") {
+        const ov = getSessionOverride(sessionID)
+        // Sticky /model during plan follow-ups: keep existing model if set.
+        const modelPatch =
+          planTurn.phase === "plan" && ov?.model && !planTurn.statusLine ? undefined : planTurn.model
+        setSessionOverride(sessionID, {
+          phase: planTurn.phase,
+          ...(modelPatch ? { model: modelPatch } : {}),
+        })
+        promptAgent = planTurn.agent
+        promptText = planTurn.promptText
+        phaseStatus = planTurn.statusLine
+        log.info("owui analyst plan turn", {
+          sessionID,
+          agent: promptAgent,
+          phase: planTurn.phase,
+          transition: Boolean(planTurn.statusLine),
+        })
+      }
+      // altimate_change end
+
       const firePrompt = () => {
         const ov = getSessionOverride(sessionID)
         return SessionPrompt.prompt({
           sessionID,
-          agent,
+          agent: promptAgent,
           model: ov?.model
             ? {
                 providerID: ProviderID.make(ov.model.providerID),
@@ -944,7 +1016,7 @@ export const OpenAIRoutes = lazy(() =>
               }
             : undefined,
           variant: ov?.variant,
-          parts: [{ type: "text", text: userMessage }],
+          parts: [{ type: "text", text: promptText }],
         }).catch((err) => {
           log.error("prompt failed", { sessionID, error: err instanceof Error ? err.message : String(err) })
           Bus.publish(Session.Event.Error, {
@@ -956,7 +1028,7 @@ export const OpenAIRoutes = lazy(() =>
 
       if (!wantStream) {
         // Non-streaming: buffer assistant text and return a single completion.
-        let text = ""
+        let text = phaseStatus ? `${phaseStatus}\n\n` : ""
         let errored: string | undefined
         const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
           sessionID,
@@ -1015,6 +1087,17 @@ export const OpenAIRoutes = lazy(() =>
             delta: { role: "assistant" },
           }),
         )
+        if (phaseStatus) {
+          await write(
+            chunk({
+              id: completionID,
+              model,
+              author: "assistant",
+              messageType: "text",
+              delta: { content: `${phaseStatus}\n\n` },
+            }),
+          )
+        }
 
         const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
           sessionID,

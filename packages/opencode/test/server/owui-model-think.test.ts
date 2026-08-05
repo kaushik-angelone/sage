@@ -6,13 +6,13 @@ import {
   setSessionOverride,
 } from "../../src/server/routes/owui-session-overrides"
 import {
-  BUILDER_SLASH_DENIAL,
+  MODEL_THINK_SLASH_DENIAL,
   coerceOwuiGroupIds,
   collectOwuiGroupIds,
   formatGroupSlashDenial,
   formatRegisteredModels,
   formatThinkStatus,
-  isBuilderAgent,
+  allowsModelThinkSlash,
   isSlashGroupAllowed,
   parseOwuiSlashCommand,
   parseSlashGroupAllowlist,
@@ -58,12 +58,14 @@ describe("OWUI /model and /think slash helpers", () => {
     expect(parseOwuiSlashCommand("/models")).toBeUndefined()
   })
 
-  test("builder gate", () => {
-    expect(isBuilderAgent("builder")).toBe(true)
-    expect(isBuilderAgent("Builder")).toBe(true)
-    expect(isBuilderAgent("analyst")).toBe(false)
-    expect(isBuilderAgent(undefined)).toBe(false)
-    expect(BUILDER_SLASH_DENIAL).toContain("builder mode")
+  test("builder/analyst gate", () => {
+    expect(allowsModelThinkSlash("builder")).toBe(true)
+    expect(allowsModelThinkSlash("Builder")).toBe(true)
+    expect(allowsModelThinkSlash("analyst")).toBe(true)
+    expect(allowsModelThinkSlash("Analyst")).toBe(true)
+    expect(allowsModelThinkSlash("plan")).toBe(false)
+    expect(allowsModelThinkSlash(undefined)).toBe(false)
+    expect(MODEL_THINK_SLASH_DENIAL).toContain("builder or analyst")
   })
 
   test("slash group allowlist: empty env allows all", () => {

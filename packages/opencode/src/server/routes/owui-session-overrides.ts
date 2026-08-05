@@ -13,10 +13,14 @@ export type SessionModelOverride = {
   modelID: string
 }
 
+export type SessionPhase = "plan" | "execute"
+
 export type SessionOverride = {
   model?: SessionModelOverride
   /** Thinking / reasoning variant key for the active model (e.g. "high"). */
   variant?: string
+  /** Analyst OWUI plan→execute phase (bridge-side; not used for builder). */
+  phase?: SessionPhase
 }
 
 const memory = new Map<string, SessionOverride>()
@@ -33,7 +37,11 @@ export function getSessionOverride(sessionID: SessionID | string): SessionOverri
 
 export function setSessionOverride(
   sessionID: SessionID | string,
-  patch: Partial<SessionOverride> & { clearVariant?: boolean; clearModel?: boolean },
+  patch: Partial<SessionOverride> & {
+    clearVariant?: boolean
+    clearModel?: boolean
+    clearPhase?: boolean
+  },
 ): SessionOverride {
   const id = key(sessionID)
   const prev = memory.get(id) ?? {}
@@ -42,6 +50,8 @@ export function setSessionOverride(
   else if (patch.model) next.model = { ...patch.model }
   if (patch.clearVariant) delete next.variant
   else if (patch.variant !== undefined) next.variant = patch.variant
+  if (patch.clearPhase) delete next.phase
+  else if (patch.phase !== undefined) next.phase = patch.phase
   memory.set(id, next)
   return getSessionOverride(id)!
 }
