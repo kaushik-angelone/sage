@@ -16,7 +16,14 @@
 //   ALTIMATE_OWUI_PROJECT_DIR  Absolute path of the repo the agent operates on.
 //                              Falls back to OPENCODE_PROJECT_DIR, the
 //                              x-opencode-directory header, then process.cwd().
-//   ALTIMATE_OWUI_MODEL        Model id advertised on /v1/models (default "altimate-code").
+//   ALTIMATE_OWUI_OT_ROOT      If set, per-user Open Terminal workspace mode:
+//                              project = $OT_ROOT/<sanitized-user-id>/altimate_context
+//                              (seeded from ALTIMATE_OWUI_OT_SEED or $OT_ROOT/_skel).
+//                              Host seed is never written. Requires Forward User Info.
+//   ALTIMATE_OWUI_OT_SEED      Seed tree for per-user copies (default: $OT_ROOT/_skel).
+//   ALTIMATE_OWUI_MODEL        Host /v1/models id when OT_ROOT unset (default "altimate-code").
+//   ALTIMATE_OT_OWUI_MODEL     OT-mode /v1/models id when OT_ROOT set (default "altimate-ot").
+//                              Host serve never advertises this id.
 //   ALTIMATE_OWUI_AGENT        Agent to run (optional; uses the session default otherwise).
 //   ALTIMATE_OWUI_PERMISSION   "approve" (default) auto-approves tool permission
 //                              requests with reply "once"; anything else rejects.
@@ -58,6 +65,8 @@ import {
   parseOwuiSlashCommand,
 } from "./owui-slash"
 import { setOwuiTraceContext } from "./owui-trace-context"
+import { makeOwuiWriter } from "./owui-sse"
+import { ensureOtUserProject, resolveOtSeed } from "./owui-ot-workspace"
 import { ModelID, ProviderID } from "../../provider/schema"
 
 const log = Log.create({ service: "openai-bridge" })
@@ -83,7 +92,15 @@ function formatQuestion(req: Question.Request): string {
 // altimate_change end
 
 function modelID() {
-  return process.env["ALTIMATE_OWUI_MODEL"] || "altimate-code"
+  // OT serve (ALTIMATE_OWUI_OT_ROOT): only advertise the OT model id.
+  // Host ./run.sh: only ALTIMATE_OWUI_MODEL — never altimate-ot.
+  if ((process.env["ALTIMATE_OWUI_OT_ROOT"] || "").trim()) {
+    return (process.env["ALTIMATE_OT_OWUI_MODEL"] || "altimate-ot").trim() || "altimate-ot"
+  }
+  const host = (process.env["ALTIMATE_OWUI_MODEL"] || "altimate-code").trim() || "altimate-code"
+  const ot = (process.env["ALTIMATE_OT_OWUI_MODEL"] || "altimate-ot").trim() || "altimate-ot"
+  if (host === ot) return "altimate-code"
+  return host
 }
 
 /** Same as data-agent owui_client_v5: X-OpenWebUI-User-Email, else anonymous. */
@@ -95,6 +112,13 @@ function owuiUserId(c: { req: { header: (name: string) => string | undefined } }
   return crypto.randomUUID()
 }
 
+/** Prefer stable id header (same value OWUI sends Open Terminal as X-User-Id). */
+function owuiUserIdForOt(c: { req: { header: (name: string) => string | undefined } }): string {
+  const id = (c.req.header("x-openwebui-user-id") || c.req.header("x-user-id") || "").trim()
+  if (id) return id
+  return owuiUserId(c)
+}
+
 function decode(value: string) {
   try {
     return decodeURIComponent(value)
@@ -103,7 +127,18 @@ function decode(value: string) {
   }
 }
 
-function resolveDirectory(headerDir: string | undefined) {
+function resolveDirectory(
+  c: { req: { header: (name: string) => string | undefined } },
+  headerDir: string | undefined,
+) {
+  // Per-user OT workspace: $ALTIMATE_OWUI_OT_ROOT/<user>/altimate_context
+  const otRoot = (process.env["ALTIMATE_OWUI_OT_ROOT"] || "").trim()
+  if (otRoot) {
+    const seed = resolveOtSeed(otRoot, (process.env["ALTIMATE_OWUI_OT_SEED"] || "").trim() || undefined)
+    const project = ensureOtUserProject(otRoot, owuiUserIdForOt(c), seed)
+    log.info("ot workspace", { user: owuiUserIdForOt(c), project })
+    return Filesystem.resolve(project)
+  }
   const raw =
     process.env["ALTIMATE_OWUI_PROJECT_DIR"] || process.env["OPENCODE_PROJECT_DIR"] || headerDir || process.cwd()
   return Filesystem.resolve(decode(raw))
@@ -568,12 +603,11 @@ function consumeSession(input: {
             error,
           })
           // Charts: plot_dataframe (and any tool) can put HTML in metadata.embeds.
-          // Emit a silent "Rich UI Embed" tool-call the OWUI filter turns into iframes
-          // (same contract as data-agent owui_client_v5).
+          // Emit one silent "Rich UI Embed" tool-call per chart so each SSE line
+          // stays under Open WebUI's aiohttp 128KiB limit (filter accumulates).
           if (state.status === "completed" && !error) {
-            const embeds = extractEmbeds(state.metadata)
-            if (embeds.length > 0) {
-              emit("tool_call", { name: "Rich UI Embed", args: { embeds } })
+            for (const html of extractEmbeds(state.metadata)) {
+              emit("tool_call", { name: "Rich UI Embed", args: { embeds: [html] } })
             }
           }
           return
@@ -638,7 +672,7 @@ export const OpenAIRoutes = lazy(() =>
     // before any handler runs. OWUI clients don't send x-opencode-directory, so the
     // directory comes from env. Mirrors the global directory middleware in server.ts.
     .use("/v1/*", async (c, next) => {
-      const directory = resolveDirectory(c.req.header("x-opencode-directory"))
+      const directory = resolveDirectory(c, c.req.header("x-opencode-directory"))
       return WorkspaceContext.provide({
         workspaceID: undefined,
         async fn() {
@@ -742,7 +776,9 @@ export const OpenAIRoutes = lazy(() =>
         c.header("X-Accel-Buffering", "no")
         const startedAtQ = Date.now()
         return streamSSE(c, async (stream) => {
-          const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
+          const { write, flush } = makeOwuiWriter(stream, {
+            warn: (msg, data) => log.warn(msg, data),
+          })
           await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { role: "assistant" } }))
           const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
             sessionID,
@@ -767,6 +803,7 @@ export const OpenAIRoutes = lazy(() =>
           } finally {
             unsubscribe()
           }
+          await flush()
           flushText()
           if (!wasAccessDenied()) {
             const recap = renderSqlRecap(sqlSteps)
@@ -776,6 +813,7 @@ export const OpenAIRoutes = lazy(() =>
           // Content-based completion signal — survives OWUI stripping custom choice fields.
           await write(executionCompleteChunk({ id: completionIDQ, model, durationSec: durationQ }))
           await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: {}, finishReason: "stop", overallDuration: durationQ, streamComplete: true }))
+          await flush()
           await stream.writeSSE({ data: "[DONE]" })
         })
       }
@@ -851,7 +889,9 @@ export const OpenAIRoutes = lazy(() =>
         c.header("X-Accel-Buffering", "no")
         const startedAtSlash = Date.now()
         return streamSSE(c, async (stream) => {
-          const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
+          const { write, flush } = makeOwuiWriter(stream, {
+            warn: (msg, data) => log.warn(msg, data),
+          })
           await write(
             chunk({
               id: completionID,
@@ -886,6 +926,7 @@ export const OpenAIRoutes = lazy(() =>
               streamComplete: true,
             }),
           )
+          await flush()
           await stream.writeSSE({ data: "[DONE]" })
         })
       }
@@ -960,7 +1001,9 @@ export const OpenAIRoutes = lazy(() =>
       c.header("X-Accel-Buffering", "no")
       const startedAt = Date.now()
       return streamSSE(c, async (stream) => {
-        const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
+        const { write, flush } = makeOwuiWriter(stream, {
+          warn: (msg, data) => log.warn(msg, data),
+        })
 
         // Initial assistant role delta.
         await write(
@@ -1057,6 +1100,7 @@ export const OpenAIRoutes = lazy(() =>
         } finally {
           unsubscribe()
         }
+        await flush()
 
         // Flush buffered assistant text (or the access-denial message alone).
         // Executed Queries is skipped entirely on domain access denial.
@@ -1100,6 +1144,7 @@ export const OpenAIRoutes = lazy(() =>
             streamComplete: true,
           }),
         )
+        await flush()
         await stream.writeSSE({ data: "[DONE]" })
       })
     }),
