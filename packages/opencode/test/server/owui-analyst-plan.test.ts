@@ -6,8 +6,9 @@ import {
   analystPlanModelOverride,
   emptyPlanHelp,
   executePlanPrompt,
-  isPlanApprovalPhrase,
+  isPlanPrefixed,
   parseAnalystPhaseSlash,
+  planExitDisclaimer,
   resolveAnalystPlanTurn,
 } from "../../src/server/routes/owui-analyst-plan"
 import {
@@ -27,23 +28,19 @@ describe("OWUI analyst /plan and /execute", () => {
     expect(parseAnalystPhaseSlash("/EXECUTE now")).toEqual({ command: "execute", arguments: "now" })
   })
 
+  test("isPlanPrefixed", () => {
+    expect(isPlanPrefixed("/plan foo")).toBe(true)
+    expect(isPlanPrefixed("  /PLAN refine")).toBe(true)
+    expect(isPlanPrefixed("/plan")).toBe(true)
+    expect(isPlanPrefixed("go ahead with the plan")).toBe(false)
+    expect(isPlanPrefixed("/execute")).toBe(false)
+    expect(isPlanPrefixed("please /plan this")).toBe(false)
+  })
+
   test("ignores non phase slash and mid-message", () => {
     expect(parseAnalystPhaseSlash("/model flash")).toBeUndefined()
     expect(parseAnalystPhaseSlash("please /plan this")).toBeUndefined()
     expect(parseAnalystPhaseSlash("hello")).toBeUndefined()
-  })
-
-  test("approval phrases are whole-message only", () => {
-    expect(isPlanApprovalPhrase("approved")).toBe(true)
-    expect(isPlanApprovalPhrase("Looks good!")).toBe(true)
-    expect(isPlanApprovalPhrase("LGTM")).toBe(true)
-    expect(isPlanApprovalPhrase("execute")).toBe(true)
-    expect(isPlanApprovalPhrase("go ahead")).toBe(true)
-    expect(isPlanApprovalPhrase("ship it")).toBe(true)
-    expect(isPlanApprovalPhrase("let's go")).toBe(true)
-    expect(isPlanApprovalPhrase("sounds good")).toBe(true)
-    expect(isPlanApprovalPhrase("approved with changes")).toBe(false)
-    expect(isPlanApprovalPhrase("please go ahead")).toBe(false)
   })
 
   test("model refs match flash / lite aliases", () => {
@@ -59,20 +56,21 @@ describe("OWUI analyst /plan and /execute", () => {
     })
   })
 
-  test("empty /plan help mentions both models", () => {
+  test("empty /plan help and disclaimer mention exit rule", () => {
     const help = emptyPlanHelp()
     expect(help).toContain("/plan <question>")
     expect(help).toContain(ANALYST_PLAN_MODEL)
-    expect(help).toContain(ANALYST_EXECUTE_MODEL)
+    expect(help).toContain("not prefixed with `/plan`")
+    expect(planExitDisclaimer()).toContain("exit plan mode")
   })
 
-  test("executePlanPrompt normalizes bare execute/approval", () => {
+  test("executePlanPrompt normalizes bare /execute only", () => {
     expect(executePlanPrompt("/execute")).toBe("Execute the plan")
-    expect(executePlanPrompt("approved")).toBe("Execute the plan")
+    expect(executePlanPrompt("go ahead with the plan")).toBe("go ahead with the plan")
     expect(executePlanPrompt("run the SQL checks")).toBe("run the SQL checks")
   })
 
-  test("resolveAnalystPlanTurn: builder noop; /plan enter; stay; execute; approval", () => {
+  test("resolveAnalystPlanTurn: /plan enter; /plan stay; non-/plan exits", () => {
     expect(
       resolveAnalystPlanTurn({ agent: "builder", userMessage: "/plan foo", phase: undefined }),
     ).toEqual({ kind: "noop" })
@@ -89,7 +87,7 @@ describe("OWUI analyst /plan and /execute", () => {
       phase: "plan",
       model: { providerID: "google", modelID: "gemini-3.6-flash" },
     })
-    expect(enter.kind === "prompt" && enter.statusLine).toContain("gemini-3.6-flash")
+    expect(enter.kind === "prompt" && enter.statusLine).toContain("not prefixed with `/plan`")
 
     expect(
       resolveAnalystPlanTurn({ agent: "analyst", userMessage: "/plan", phase: undefined }),
@@ -97,7 +95,7 @@ describe("OWUI analyst /plan and /execute", () => {
 
     const stay = resolveAnalystPlanTurn({
       agent: "analyst",
-      userMessage: "change step 2",
+      userMessage: "/plan change step 2",
       phase: "plan",
     })
     expect(stay).toMatchObject({
@@ -106,31 +104,31 @@ describe("OWUI analyst /plan and /execute", () => {
       promptText: "change step 2",
       phase: "plan",
     })
-    expect(stay.kind === "prompt" && stay.statusLine).toBeUndefined()
 
-    const exec = resolveAnalystPlanTurn({
+    const exit = resolveAnalystPlanTurn({
       agent: "analyst",
-      userMessage: "/execute",
+      userMessage: "go ahead with the plan",
       phase: "plan",
     })
-    expect(exec).toMatchObject({
+    expect(exit).toMatchObject({
+      kind: "prompt",
+      agent: "analyst",
+      promptText: "go ahead with the plan",
+      phase: "execute",
+      model: { providerID: "google", modelID: "gemini-3.5-flash-lite" },
+    })
+    expect(exit.kind === "prompt" && exit.statusLine).toContain("gemini-3.5-flash-lite")
+
+    expect(
+      resolveAnalystPlanTurn({ agent: "analyst", userMessage: "/execute", phase: "plan" }),
+    ).toMatchObject({
       kind: "prompt",
       agent: "analyst",
       promptText: "Execute the plan",
       phase: "execute",
-      model: { providerID: "google", modelID: "gemini-3.5-flash-lite" },
     })
 
-    expect(
-      resolveAnalystPlanTurn({ agent: "analyst", userMessage: "approved", phase: "plan" }),
-    ).toMatchObject({ kind: "prompt", agent: "analyst", phase: "execute" })
-
-    // Approval ignored outside plan phase
-    expect(
-      resolveAnalystPlanTurn({ agent: "analyst", userMessage: "approved", phase: "execute" }),
-    ).toEqual({ kind: "noop" })
-
-    // Normal analyst message: no auto plan
+    // Outside plan: normal message does not auto-plan
     expect(
       resolveAnalystPlanTurn({
         agent: "analyst",

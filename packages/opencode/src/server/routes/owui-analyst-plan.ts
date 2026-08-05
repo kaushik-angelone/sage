@@ -1,6 +1,6 @@
 /**
- * Analyst-only OWUI plan→execute: explicit /plan and /execute (no auto-detect yet).
- * Plan runs on gemini-3.6-flash; execute returns to analyst on gemini-3.5-flash-lite.
+ * Analyst-only OWUI plan→execute: explicit /plan only.
+ * Plan runs on gemini-3.6-flash; any non-/plan follow-up exits to analyst on flash-lite.
  */
 import { OWUI_MODEL_ALIASES } from "./owui-slash"
 import type { SessionModelOverride } from "./owui-session-overrides"
@@ -15,6 +15,11 @@ export type AnalystPhaseSlash = {
 
 export type AnalystPhase = "plan" | "execute"
 
+/** Message starts with `/plan` (keep planning). */
+export function isPlanPrefixed(text: string): boolean {
+  return /^\s*\/plan(?:\s|$)/i.test(text || "")
+}
+
 /** Match `/plan` or `/execute` as a whole user message. */
 export function parseAnalystPhaseSlash(text: string): AnalystPhaseSlash | undefined {
   const trimmed = (text || "").trim()
@@ -24,14 +29,6 @@ export function parseAnalystPhaseSlash(text: string): AnalystPhaseSlash | undefi
     command: match[1]!.toLowerCase() as "plan" | "execute",
     arguments: (match[2] ?? "").trim(),
   }
-}
-
-const APPROVAL =
-  /^(approved|looks good|lgtm|execute|go ahead|ship it|let'?s go|sounds good)[.!]?$/i
-
-/** Whole-message approval while in plan phase → switch to execute. */
-export function isPlanApprovalPhrase(text: string): boolean {
-  return APPROVAL.test((text || "").trim())
 }
 
 export function splitProviderModel(id: string): SessionModelOverride {
@@ -48,30 +45,38 @@ export function analystExecuteModelOverride(): SessionModelOverride {
   return splitProviderModel(ANALYST_EXECUTE_MODEL)
 }
 
+/** Shown on first /plan response — next message without /plan exits planning. */
+export function planExitDisclaimer(): string {
+  return (
+    `**Note:** Reply with \`/plan …\` to keep planning. ` +
+    `If your next message is not prefixed with \`/plan\`, I will exit plan mode and run as analyst on \`${ANALYST_EXECUTE_MODEL}\`.`
+  )
+}
+
 export function emptyPlanHelp(): string {
   return (
     "Usage: `/plan <question>` — plans with `" +
     ANALYST_PLAN_MODEL +
-    "`.\n" +
-    "When ready: `/execute` or reply `approved` / `looks good` / `lgtm` / `go ahead` / `ship it` " +
-    "to continue as analyst on `" +
+    "`.\n\n" +
+    planExitDisclaimer() +
+    "\n\nOptional: `/execute` runs the plan as analyst on `" +
     ANALYST_EXECUTE_MODEL +
     "`."
   )
 }
 
 export function planStatusLine(): string {
-  return `Planning with \`${ANALYST_PLAN_MODEL}\`…`
+  return `Planning with \`${ANALYST_PLAN_MODEL}\`…\n\n${planExitDisclaimer()}`
 }
 
 export function executeStatusLine(): string {
   return `Executing with \`${ANALYST_EXECUTE_MODEL}\` (analyst)…`
 }
 
-/** Prompt text for bare `/execute` or bare approval. */
+/** Prompt text for bare `/execute`. */
 export function executePlanPrompt(userText: string): string {
   const t = (userText || "").trim()
-  if (!t || parseAnalystPhaseSlash(t)?.command === "execute" || isPlanApprovalPhrase(t)) {
+  if (!t || parseAnalystPhaseSlash(t)?.command === "execute") {
     return "Execute the plan"
   }
   return t
@@ -90,8 +95,8 @@ export type AnalystPlanTurn =
     }
 
 /**
- * Pure routing for analyst OWUI plan→execute (explicit /plan only).
- * Builder / non-analyst → noop. No auto complexity detection.
+ * Pure routing for analyst OWUI plan→execute.
+ * Stay in plan only while messages are prefixed with /plan; otherwise exit.
  */
 export function resolveAnalystPlanTurn(input: {
   agent: string | undefined | null
@@ -115,7 +120,8 @@ export function resolveAnalystPlanTurn(input: {
     }
   }
 
-  if (slash?.command === "execute" || (input.phase === "plan" && isPlanApprovalPhrase(msg))) {
+  // Explicit /execute, or any non-/plan message while in plan → analyst execute.
+  if (slash?.command === "execute" || (input.phase === "plan" && !isPlanPrefixed(msg))) {
     return {
       kind: "prompt",
       agent: "analyst",
@@ -123,16 +129,6 @@ export function resolveAnalystPlanTurn(input: {
       statusLine: executeStatusLine(),
       phase: "execute",
       model: analystExecuteModelOverride(),
-    }
-  }
-
-  if (input.phase === "plan") {
-    return {
-      kind: "prompt",
-      agent: "plan",
-      promptText: msg,
-      phase: "plan",
-      model: analystPlanModelOverride(),
     }
   }
 

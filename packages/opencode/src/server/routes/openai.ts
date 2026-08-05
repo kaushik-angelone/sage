@@ -26,7 +26,7 @@
 //                              Host serve never advertises this id.
 //   ALTIMATE_OWUI_AGENT        Agent to run (optional; uses the session default otherwise).
 //                              When "analyst": /plan <q> → plan agent + gemini-3.6-flash;
-//                              /execute or approval → analyst + gemini-3.5-flash-lite.
+//                              next msg without /plan prefix (or /execute) → analyst + flash-lite.
 //   ALTIMATE_OWUI_PERMISSION   "approve" (default) auto-approves tool permission
 //                              requests with reply "once"; anything else rejects.
 //   ALTIMATE_OWUI_SESSION_MAP  Optional path for chat→session persistence
