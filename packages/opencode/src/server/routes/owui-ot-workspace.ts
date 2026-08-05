@@ -36,12 +36,12 @@ function hasContextMarker(dir: string): boolean {
 }
 
 function chmodOpen(dir: string) {
-  // Keep home private (OT multi-user uses 700). World a+rwX + home 755 let
-  // every OT user read every other home — that leaked edits across users.
-  // Prefer ACL for the host uid so sage can write without opening o+rwx.
+  // Keep o-rwx (no cross-user browse). Keep g+rwX so OT server/group can
+  // participate; host sage uses ACL. Do not chown here — ownership is fixed
+  // in the OT container via run-open-terminal.sh --fix-perms.
   const home = path.dirname(dir)
-  spawnSync("chmod", ["700", home], { stdio: "ignore" })
-  spawnSync("chmod", ["-R", "u+rwX,go-rwx", dir], { stdio: "ignore" })
+  spawnSync("chmod", ["750", home], { stdio: "ignore" })
+  spawnSync("chmod", ["-R", "ug+rwX,o-rwx", dir], { stdio: "ignore" })
   const uid = String(process.getuid?.() ?? "")
   if (uid) {
     const acl = spawnSync("setfacl", ["-m", `u:${uid}:--x`, home], { stdio: "ignore" })
@@ -51,7 +51,7 @@ function chmodOpen(dir: string) {
       return
     }
   }
-  // ponytail: no ACL — fall back to open perms so host sage can still write.
+  // ponytail: no ACL — fall back so host sage can still write.
   spawnSync("chmod", ["711", home], { stdio: "ignore" })
   spawnSync("chmod", ["-R", "a+rwX", dir], { stdio: "ignore" })
 }
