@@ -142,6 +142,9 @@ if [ "$SKIP_BUILD" = false ]; then
   (
     cd "$PKG_DIR"
     export PATH="${HOME}/.bun/bin:${PATH}"
+    # NODE_TLS_REJECT_UNAUTHORIZED=0: bun's built-in CA bundle doesn't trust
+    # TLS-intercepting proxies; this lets bun install reach the npm registry.
+    export NODE_TLS_REJECT_UNAUTHORIZED=0
     # No --skip-install: linux cross-compile needs platform-specific native deps.
     bun run script/build.ts --target-index="$TARGET_INDEX"
   )

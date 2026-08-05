@@ -6,6 +6,10 @@ import type { SqlExecuteResult } from "../native/types"
 import { classifyAndCheck, computeSqlFingerprint } from "./sql-classify"
 import { Telemetry } from "../telemetry"
 // altimate_change end
+// altimate_change start — group domain access control
+import { checkSqlAccess } from "../access/access-control"
+import { getOwuiTraceContext } from "../../server/routes/owui-trace-context"
+// altimate_change end
 // altimate_change start — progressive disclosure suggestions
 import { PostConnectSuggestions } from "./post-connect-suggestions"
 // altimate_change end
@@ -30,6 +34,18 @@ export const SqlExecuteTool = Tool.define("sql_execute", {
     // altimate_change end
   }),
   async execute(args, ctx) {
+    // altimate_change start — group domain access control
+    const _groups = getOwuiTraceContext(ctx.sessionID)?.groups ?? []
+    const _access = checkSqlAccess(args.query, _groups)
+    if (!_access.allow) {
+      const msg = `Access denied: your account does not have permission to query ${_access.deniedTables?.join(", ")}. You belong to a group that restricts access to this data domain. For requesting access, contact himanshu.1verma@angelone.in / Kaushik.Sivashankar@angelone.in.`
+      return {
+        title: "SQL: ACCESS DENIED",
+        metadata: { rowCount: 0, truncated: false, reason: args.reason, error: msg, accessDenied: true },
+        output: msg,
+      }
+    }
+    // altimate_change end
     // altimate_change start - SQL write access control
     // Permission checks OUTSIDE try/catch so denial errors propagate to the framework
     const { queryType, blocked } = classifyAndCheck(args.query)
@@ -51,7 +67,7 @@ export const SqlExecuteTool = Tool.define("sql_execute", {
     // but does NOT block execution. Used to measure catch rate before deciding
     // whether to enable blocking in a future release. Fire-and-forget so it
     // doesn't add latency to the sql_execute hot path.
-    preValidateSql(args.query, args.warehouse, queryType).catch(() => {})
+    preValidateSql(args.query, args.warehouse, queryType).catch(() => { })
     // altimate_change end
 
     try {

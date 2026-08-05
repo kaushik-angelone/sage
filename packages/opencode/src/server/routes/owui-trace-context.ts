@@ -13,6 +13,8 @@ export type OwuiTraceContext = {
   /** Advertised /v1 model id (distinguishes builder vs analyst portables). */
   modelId: string
   agent?: string
+  /** OWUI group names injected by filter.py inlet(). Used for domain access control. */
+  groups: string[]
 }
 
 const bySession = new Map<string, OwuiTraceContext>()

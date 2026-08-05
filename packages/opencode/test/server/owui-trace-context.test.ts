@@ -11,7 +11,7 @@ import path from "path"
 
 describe("owui-trace-context", () => {
   test("stores and clears per session", () => {
-    setOwuiTraceContext("ses_a", { userId: "a@x.com", modelId: "altimate-builder", agent: "builder" })
+    setOwuiTraceContext("ses_a", { userId: "a@x.com", modelId: "altimate-builder", agent: "builder", groups: [] })
     expect(getOwuiTraceContext("ses_a")?.userId).toBe("a@x.com")
     clearOwuiTraceContext("ses_a")
     expect(getOwuiTraceContext("ses_a")).toBeUndefined()

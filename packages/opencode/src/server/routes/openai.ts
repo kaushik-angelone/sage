@@ -395,6 +395,10 @@ function consumeSession(input: {
   // Deltas can race ahead of the part.updated that classifies a part as
   // text vs reasoning. Buffer until we know which emit kind to use.
   const pendingDeltas = new Map<string, string[]>()
+  // Buffer assistant text until end-of-turn so an access denial can replace
+  // fabricated analysis with the denial message alone.
+  const bufferedText: string[] = []
+  let accessDeniedMsg: string | undefined
   let sawActivity = false
 
   let resolveDone: () => void
@@ -404,6 +408,11 @@ function consumeSession(input: {
 
   const permissionMode = (process.env["ALTIMATE_OWUI_PERMISSION"] || "approve").toLowerCase()
 
+  const queueText = (content: string) => {
+    if (!content || accessDeniedMsg) return
+    bufferedText.push(content)
+  }
+
   const flushPending = (partID: string, kind: "text" | "reasoning") => {
     const buffered = pendingDeltas.get(partID)
     if (!buffered?.length) {
@@ -411,8 +420,21 @@ function consumeSession(input: {
       return
     }
     pendingDeltas.delete(partID)
-    for (const delta of buffered) emit(kind, { content: delta })
+    for (const delta of buffered) {
+      if (kind === "text") queueText(delta)
+      else emit(kind, { content: delta })
+    }
   }
+
+  const flushText = () => {
+    if (accessDeniedMsg) {
+      emit("text", { content: accessDeniedMsg })
+      return
+    }
+    for (const content of bufferedText) emit("text", { content })
+  }
+
+  const wasAccessDenied = () => Boolean(accessDeniedMsg)
 
   const unsubscribe = Bus.subscribeAll((event: { type: string; properties: any }) => {
     const props = event.properties ?? {}
@@ -425,11 +447,11 @@ function consumeSession(input: {
       // Reasoning parts share field "text" deltas; map them to OWUI's native
       // reasoning_content so the Thought collapsible can render them.
       if (reasoningParts.has(props.partID)) {
-        emit("reasoning", { content: props.delta })
+        if (!accessDeniedMsg) emit("reasoning", { content: props.delta })
         return
       }
       if (textParts.has(props.partID)) {
-        emit("text", { content: props.delta })
+        queueText(props.delta)
         return
       }
       const queue = pendingDeltas.get(props.partID) ?? []
@@ -449,7 +471,7 @@ function consumeSession(input: {
         if (part.time?.end && !deltaStreamedParts.has(part.id) && !finalizedTextParts.has(part.id)) {
           finalizedTextParts.add(part.id)
           const text = (part.text ?? "").trim()
-          if (text) emit("text", { content: text })
+          if (text) queueText(text)
         }
         return
       }
@@ -461,15 +483,16 @@ function consumeSession(input: {
         if (part.time?.end && !deltaStreamedParts.has(part.id) && !finalizedTextParts.has(part.id)) {
           finalizedTextParts.add(part.id)
           const text = (part.text ?? "").trim()
-          if (text) emit("reasoning", { content: text })
+          if (text && !accessDeniedMsg) emit("reasoning", { content: text })
         }
         return
       }
 
       if (part.type === "tool") {
+        if (accessDeniedMsg) return
         const state = part.state ?? {}
         const trackSql = () => {
-          if (!SQL_TOOLS.has(part.tool)) return
+          if (accessDeniedMsg || !SQL_TOOLS.has(part.tool)) return
           const step = sqlStepFromInput(state.input)
           if (!step) return
           const existing = sqlStepByCall.get(part.callID)
@@ -504,6 +527,32 @@ function consumeSession(input: {
           const metadataError = state.metadata?.error
           const error =
             typeof state.error === "string" ? state.error : typeof metadataError === "string" ? metadataError : undefined
+          // altimate_change start — domain access denial: stop turn, hide SQL recap
+          const accessDenied =
+            state.metadata?.accessDenied === true ||
+            (typeof state.output === "string" && state.output.startsWith("Access denied:")) ||
+            (typeof error === "string" && error.startsWith("Access denied:"))
+          if (accessDenied) {
+            accessDeniedMsg =
+              (typeof state.output === "string" && state.output.startsWith("Access denied:")
+                ? state.output
+                : undefined) ||
+              (typeof error === "string" ? error : undefined) ||
+              "Access denied."
+            sqlSteps.length = 0
+            sqlStepByCall.clear()
+            bufferedText.length = 0
+            emit("tool_done", {
+              name: part.tool,
+              duration,
+              status: "error",
+              error: accessDeniedMsg,
+            })
+            SessionPrompt.cancel(sessionID).catch(() => {})
+            resolveDone()
+            return
+          }
+          // altimate_change end
           const step = sqlStepByCall.get(part.callID)
           if (step) {
             if (error) step.failed = true
@@ -580,7 +629,7 @@ function consumeSession(input: {
   // finish() force-resolves the turn. Used when the (blocking) prompt promise
   // settles, so a prompt that never reaches an "idle" status (e.g. it throws
   // before the run starts) cannot hang the SSE stream open forever.
-  return { done, unsubscribe, finish: () => resolveDone(), sqlSteps }
+  return { done, unsubscribe, finish: () => resolveDone(), sqlSteps, flushText, wasAccessDenied }
 }
 
 export const OpenAIRoutes = lazy(() =>
@@ -638,10 +687,14 @@ export const OpenAIRoutes = lazy(() =>
 
       const sessionID = await resolveSession(chatKey, userMessage)
       // Stash before firePrompt so TraceConsumer can attach user/model on first events.
+      // altimate_change start — group access control: read group names injected by filter.py
+      const userGroups: string[] = Array.isArray(body?.user_groups) ? body.user_groups : []
+      // altimate_change end
       setOwuiTraceContext(sessionID, {
         userId,
         modelId: model,
         agent: agent || undefined,
+        groups: userGroups,
       })
       const completionID = `chatcmpl-${sessionID}-${Date.now().toString(36)}`
 
@@ -654,7 +707,7 @@ export const OpenAIRoutes = lazy(() =>
         if (!wantStream) {
           let text = ""
           let errored: string | undefined
-          const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+          const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
             sessionID,
             sessionKey: chatKey,
             emit: (kind, payload) => {
@@ -672,12 +725,16 @@ export const OpenAIRoutes = lazy(() =>
           } finally {
             unsubscribe()
           }
+          flushText()
+          const body = wasAccessDenied()
+            ? text
+            : (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps)
           return c.json({
             id: completionIDQ,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
             model,
-            choices: [{ index: 0, message: { role: "assistant", content: (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps) }, finish_reason: "stop" }],
+            choices: [{ index: 0, message: { role: "assistant", content: body }, finish_reason: "stop" }],
           })
         }
         c.header("Cache-Control", "no-cache")
@@ -687,7 +744,7 @@ export const OpenAIRoutes = lazy(() =>
         return streamSSE(c, async (stream) => {
           const write = (obj: unknown) => stream.writeSSE({ data: JSON.stringify(obj) })
           await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { role: "assistant" } }))
-          const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+          const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
             sessionID,
             sessionKey: chatKey,
             emit: (kind, payload) => {
@@ -710,8 +767,11 @@ export const OpenAIRoutes = lazy(() =>
           } finally {
             unsubscribe()
           }
-          const recap = renderSqlRecap(sqlSteps)
-          if (recap) await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: recap } }))
+          flushText()
+          if (!wasAccessDenied()) {
+            const recap = renderSqlRecap(sqlSteps)
+            if (recap) await write(chunk({ id: completionIDQ, model, author: "assistant", messageType: "text", delta: { content: recap } }))
+          }
           const durationQ = (Date.now() - startedAtQ) / 1000
           // Content-based completion signal — survives OWUI stripping custom choice fields.
           await write(executionCompleteChunk({ id: completionIDQ, model, durationSec: durationQ }))
@@ -857,7 +917,7 @@ export const OpenAIRoutes = lazy(() =>
         // Non-streaming: buffer assistant text and return a single completion.
         let text = ""
         let errored: string | undefined
-        const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+        const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
           sessionID,
           sessionKey: chatKey,
           emit: (kind, payload) => {
@@ -873,6 +933,10 @@ export const OpenAIRoutes = lazy(() =>
         } finally {
           unsubscribe()
         }
+        flushText()
+        const body = wasAccessDenied()
+          ? text
+          : (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps)
         return c.json({
           id: completionID,
           object: "chat.completion",
@@ -883,7 +947,7 @@ export const OpenAIRoutes = lazy(() =>
               index: 0,
               message: {
                 role: "assistant",
-                content: (errored ? `${text}\n\n**Error:** ${errored}` : text) + renderSqlRecap(sqlSteps),
+                content: body,
               },
               finish_reason: "stop",
             },
@@ -909,7 +973,7 @@ export const OpenAIRoutes = lazy(() =>
           }),
         )
 
-        const { done, unsubscribe, finish, sqlSteps } = consumeSession({
+        const { done, unsubscribe, finish, sqlSteps, flushText, wasAccessDenied } = consumeSession({
           sessionID,
           sessionKey: chatKey,
           emit: (kind, payload) => {
@@ -994,21 +1058,26 @@ export const OpenAIRoutes = lazy(() =>
           unsubscribe()
         }
 
-        // Stream the Executed Queries recap as ordinary assistant text BEFORE the
-        // completion sentinel. Open WebUI rebuilds the saved message from
-        // accumulated stream deltas / output items, so anything pushed only via
-        // the filter's event emitter is wiped when the turn finishes.
-        const recap = renderSqlRecap(sqlSteps)
-        if (recap) {
-          await write(
-            chunk({
-              id: completionID,
-              model,
-              author: "assistant",
-              messageType: "text",
-              delta: { content: recap },
-            }),
-          )
+        // Flush buffered assistant text (or the access-denial message alone).
+        // Executed Queries is skipped entirely on domain access denial.
+        flushText()
+        if (!wasAccessDenied()) {
+          // Stream the Executed Queries recap as ordinary assistant text BEFORE the
+          // completion sentinel. Open WebUI rebuilds the saved message from
+          // accumulated stream deltas / output items, so anything pushed only via
+          // the filter's event emitter is wiped when the turn finishes.
+          const recap = renderSqlRecap(sqlSteps)
+          if (recap) {
+            await write(
+              chunk({
+                id: completionID,
+                model,
+                author: "assistant",
+                messageType: "text",
+                delta: { content: recap },
+              }),
+            )
+          }
         }
 
         // Completion pill: emit a silent tool-call first. Open WebUI often strips
